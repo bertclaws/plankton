@@ -1,0 +1,60 @@
+# ty Type Checker Configuration
+# Migrated from pyproject.toml [tool.ty.*] sections
+
+[environment]
+# Target minimum supported Python version (not CI runtime version).
+# CI runs 3.13, but we target 3.11 to ensure type compatibility
+# across all supported versions per best practice.
+python-version = "3.11"
+
+[src]
+include = ["src", "tests"]
+exclude = [
+  "scripts/",
+  "docs/",
+  "build/",
+  "dist/",
+  ".venv/",
+  "**/__pycache__/",
+]
+respect-ignore-files = true
+
+[rules]
+division-by-zero = "error"
+possibly-unresolved-reference = "error"
+invalid-argument-type = "error"
+missing-argument = "error"
+unsupported-operator = "error"
+unused-ignore-comment = "warn"
+redundant-cast = "warn"
+unresolved-import = "warn"
+
+[terminal]
+output-format = "full"
+error-on-warning = false
+
+# =============================================================================
+# TEST FILES - RELAXED RULES
+# =============================================================================
+# ASYMMETRY WITH .pre-commit-config.yaml (intentional):
+# - ty.toml: Includes tests/ with relaxed rules (comprehensive analysis)
+# - Pre-commit: Excludes tests/ entirely (fast commits, no blocking)
+# Rationale: Test code legitimately uses mocks, dynamic fixtures, and intentional
+# type violations. We warn (not error) to surface issues without blocking commits.
+# See: https://docs.astral.sh/ty/configuration/#per-directory-rule-overrides
+[[overrides]]
+include = ["tests/**"]
+
+[overrides.rules]
+possibly-unresolved-reference = "warn"
+unresolved-import = "ignore"
+# Additional rules relaxed to warn (from test errors analysis)
+invalid-argument-type = "warn"
+not-subscriptable = "warn"
+unknown-argument = "warn"
+unresolved-attribute = "warn"
+invalid-assignment = "warn"
+unsupported-operator = "warn"
+missing-argument = "warn"
+not-iterable = "warn"
+division-by-zero = "warn"

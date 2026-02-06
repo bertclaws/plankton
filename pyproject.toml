@@ -1,0 +1,44 @@
+[project]
+name = "my-project"
+version = "0.1.0"
+description = "Project description"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    # Linting & formatting
+    "ruff",
+    "ty",
+    "flake8",
+    "flake8-pydantic",
+    "flake8-async",
+    "vulture",
+    "bandit",
+    # Testing
+    "pytest",
+    "pytest-xdist",
+    # Pre-commit
+    "pre-commit",
+    # YAML linting
+    "yamllint",
+    # JSON schema validation
+    "check-jsonschema",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-n auto"
+
+[tool.bandit]
+exclude_dirs = ["tests", "docs", ".venv", "scripts"]
+skips = []
+
+[tool.vulture]
+min_confidence = 80
+paths = ["src"]
+exclude = ["tests", ".venv"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

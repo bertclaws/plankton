@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Linter / formatter caches
+.ruff_cache/
+.ty/
+.mypy_cache/
+
+# Node (jscpd, markdownlint-cli2)
+node_modules/
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Docker
+docker-compose.override.yml
+
+# Reports (jscpd output)
+reports/
+
+# Claude Code session artifacts
+.claude/.tmp/
+.claude/plans/
+.claude/todos/
+.claude/settings.local.json

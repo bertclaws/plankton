@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "_comment": "Claude Code Hooks Configuration - edit this file to customize hook behavior",
+
+  "languages": {
+    "python": true,
+    "shell": true,
+    "yaml": true,
+    "json": true,
+    "toml": true,
+    "dockerfile": true,
+    "markdown": true,
+    "typescript": false
+  },
+
+  "protected_files": [
+    ".markdownlint.jsonc",
+    ".markdownlint-cli2.jsonc",
+    ".shellcheckrc",
+    ".yamllint",
+    ".hadolint.yaml",
+    ".jscpd.json",
+    ".flake8",
+    "taplo.toml",
+    ".ruff.toml",
+    "ty.toml"
+  ],
+
+  "exclusions": [
+    "tests/",
+    "docs/",
+    ".venv/",
+    "scripts/",
+    "node_modules/",
+    ".git/",
+    ".claude/"
+  ],
+
+  "phases": {
+    "auto_format": true,
+    "subprocess_delegation": true
+  },
+
+  "subprocess": {
+    "timeout": 300,
+    "model_selection": {
+      "sonnet_patterns": "C901|PLR[0-9]+|PYD[0-9]+|FAST[0-9]+|ASYNC[0-9]+|unresolved-import|MD[0-9]+|D[0-9]+",
+      "opus_patterns": "unresolved-attribute|type-assertion",
+      "volume_threshold": 5
+    }
+  },
+
+  "jscpd": {
+    "session_threshold": 3,
+    "scan_dirs": ["src/", "lib/"],
+    "advisory_only": true
+  }
+}

@@ -1,0 +1,27 @@
+{
+  // markdownlint-cli2 configuration
+  // Uses .markdownlint.jsonc for rules, this file for CLI options
+  // See: https://github.com/DavidAnson/markdownlint-cli2
+
+  // Suppress verbose discovery output
+  "noBanner": true,
+  "noProgress": true,
+
+  // Paths to lint
+  "globs": [
+    "*.md",
+    ".claude/**/*.md",
+    ".github/**/*.md",
+    "docs/**/*.md"
+  ],
+
+  // Exclusions (working documents, build artifacts)
+  "ignores": [
+    ".claude/.tmp/**",
+    ".claude/plans/**",
+    ".venv/**",
+    "node_modules/**",
+    "build/**",
+    "dist/**"
+  ]
+}

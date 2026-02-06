@@ -1,0 +1,915 @@
+#!/bin/bash
+# multi_linter.sh - Claude Code PostToolUse hook for multi-language linting
+# Supports: Python (ruff+ty+flake8-pydantic+flake8-async), Shell (shellcheck+shfmt),
+#           YAML (yamllint), JSON (jaq), Dockerfile (hadolint),
+#           TOML (taplo), Markdown (markdownlint-cli2)
+#
+# Three-Phase Architecture:
+#   Phase 1: Auto-format files (silent on success)
+#   Phase 2: Collect unfixable violations as JSON
+#   Phase 3: Delegate to claude subprocess for fixes, then verify
+#
+# Dependencies:
+#   Required: jaq (JSON parsing), ruff (Python), claude (subprocess delegation)
+#   Optional: shellcheck, shfmt, yamllint, hadolint, taplo, markdownlint-cli2,
+#             ty (type checking), flake8-pydantic
+#
+# Project configs: .ruff.toml, ty.toml, taplo.toml, .yamllint,
+#                  .shellcheckrc, .hadolint.yaml, .markdownlint.jsonc
+#
+# Exit Code Strategy:
+#   0 - No issues or all issues fixed by delegation
+#   2 - Issues remain after delegation attempt
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION LOADING
+# ============================================================================
+
+# Load configuration from config.json (falls back to all-enabled if missing)
+load_config() {
+  local config_file="${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/config.json"
+  if [[ -f "${config_file}" ]]; then
+    CONFIG_JSON=$(cat "${config_file}")
+  else
+    CONFIG_JSON='{}'
+  fi
+}
+
+# Check if a language is enabled (default: true when missing)
+is_language_enabled() {
+  local lang="$1"
+  local enabled
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r ".languages.${lang} // true" 2>/dev/null)
+  [[ "${enabled}" != "false" ]]
+}
+
+# Get exclusion patterns from config (defaults if not configured)
+get_exclusions() {
+  local defaults='["tests/","docs/",".venv/","scripts/","node_modules/",".git/",".claude/"]'
+  echo "${CONFIG_JSON}" | jaq -r ".exclusions // ${defaults} | .[]" 2>/dev/null
+}
+
+# Load model selection patterns from config (defaults from Incide)
+load_model_patterns() {
+  local default_sonnet='C901|PLR[0-9]+|PYD[0-9]+|FAST[0-9]+|ASYNC[0-9]+|unresolved-import|MD[0-9]+|D[0-9]+'
+  local default_opus='unresolved-attribute|type-assertion'
+  SONNET_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.sonnet_patterns // \"${default_sonnet}\"" 2>/dev/null)
+  OPUS_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.opus_patterns // \"${default_opus}\"" 2>/dev/null)
+  VOLUME_THRESHOLD=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.volume_threshold // 5" 2>/dev/null)
+  readonly SONNET_CODE_PATTERN OPUS_CODE_PATTERN VOLUME_THRESHOLD
+}
+
+# Check if auto-format phase is enabled (default: true)
+is_auto_format_enabled() {
+  local enabled
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.auto_format // true' 2>/dev/null)
+  [[ "${enabled}" != "false" ]]
+}
+
+# Check if subprocess delegation is enabled (default: true)
+is_subprocess_enabled() {
+  local enabled
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.subprocess_delegation // true' 2>/dev/null)
+  [[ "${enabled}" != "false" ]]
+}
+
+# Initialize configuration
+load_config
+load_model_patterns
+
+# Read JSON input from stdin
+input=$(cat)
+
+# Track if any issues found
+has_issues=false
+
+# Collected violations for delegation (JSON array)
+collected_violations="[]"
+
+# File type for delegation
+file_type=""
+
+# Subprocess timeout: config.json -> env var -> 300s default
+_config_timeout=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.timeout // 300' 2>/dev/null)
+readonly SUBPROCESS_TIMEOUT="${HOOK_SUBPROCESS_TIMEOUT:-${_config_timeout}}"
+
+# Extract file path from tool_input
+file_path=$(jaq -r '.tool_input?.file_path? // empty' <<<"${input}" 2>/dev/null) || file_path=""
+
+# Skip if no file path or file doesn't exist
+[[ -z "${file_path}" ]] && exit 0
+[[ ! -f "${file_path}" ]] && exit 0
+
+# ============================================================================
+# PATH EXCLUSION FOR SECURITY LINTERS
+# ============================================================================
+# Matches common exclusion paths for tools like vulture/bandit.
+# Used to skip security linters on test files, scripts, etc. where false
+# positives are expected (e.g., intentional security patterns in tests).
+is_excluded_from_security_linters() {
+  local fp="$1"
+
+  # Normalize absolute paths to relative (using CLAUDE_PROJECT_DIR if available)
+  if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]] && [[ "${fp}" == "${CLAUDE_PROJECT_DIR}"/* ]]; then
+    fp="${fp#"${CLAUDE_PROJECT_DIR}"/}"
+  fi
+
+  local exclusion
+  while IFS= read -r exclusion; do
+    [[ -z "${exclusion}" ]] && continue
+    if [[ "${fp}" == ${exclusion}* ]]; then
+      return 0
+    fi
+  done < <(get_exclusions)
+  return 1
+}
+
+# ============================================================================
+# DELEGATION FUNCTIONS
+# ============================================================================
+
+# Spawn claude subprocess to fix violations
+spawn_fix_subprocess() {
+  local fp="$1"
+  local violations_json="$2"
+  local ftype="$3"
+
+  # Model selection based on violation complexity
+  local count
+  count=$(echo "${violations_json}" | jaq 'length' 2>/dev/null || echo "0")
+
+  # Check for opus-level codes (complex type errors requiring architectural changes)
+  local has_opus_codes="false"
+  if echo "${violations_json}" | jaq -e '[.[] | select(.code | test("'"${OPUS_CODE_PATTERN}"'"))] | length > 0' >/dev/null 2>&1; then
+    has_opus_codes="true"
+  fi
+
+  # Check for sonnet-level codes (refactoring, Pydantic, simple type errors)
+  # Also includes markdown (MD*) and docstrings (D*) - requires semantic understanding
+  local has_sonnet_codes="false"
+  if echo "${violations_json}" | jaq -e '[.[] | select(.code | test("'"${SONNET_CODE_PATTERN}"'"))] | length > 0' >/dev/null 2>&1; then
+    has_sonnet_codes="true"
+  fi
+
+  # Select model: haiku (simple) -> sonnet (medium) -> opus (complex or >threshold violations)
+  local model="haiku"
+  if [[ "${has_sonnet_codes}" == "true" ]]; then
+    model="sonnet"
+  fi
+  if [[ "${has_opus_codes}" == "true" ]] || [[ "${count}" -gt "${VOLUME_THRESHOLD}" ]]; then
+    model="opus"
+  fi
+
+  # Debug output for testing model selection
+  # Usage: HOOK_DEBUG_MODEL=1 ./multi_linter.sh
+  if [[ "${HOOK_DEBUG_MODEL:-}" == "1" ]]; then
+    echo "[hook:model] ${model} (count=${count}, opus_codes=${has_opus_codes}, sonnet_codes=${has_sonnet_codes})" >&2
+  fi
+
+  # Determine post-fix formatter command
+  local format_cmd=""
+  case "${ftype}" in
+    python) format_cmd="ruff format '${fp}'" ;;
+    shell) format_cmd="shfmt -w -i 2 -ci -bn '${fp}'" ;;
+    toml) format_cmd="RUST_LOG=error taplo fmt '${fp}'" ;;
+    markdown) format_cmd="markdownlint-cli2 --no-globs --fix '${fp}'" ;;
+    *) format_cmd="" ;;
+  esac
+
+  # Build prompt for subprocess (file-type specific for better fixes)
+  local prompt
+  if [[ "${ftype}" == "markdown" ]]; then
+    # Markdown-specific prompt with semantic fix strategies
+    prompt="You are a markdown fixer. Fix ALL violations in ${fp}.
+
+VIOLATIONS:
+${violations_json}
+
+MARKDOWN FIX STRATEGIES:
+- MD013 (line length >80): SHORTEN content, don't wrap. Examples:
+  - 'Skip delegation, report violations directly' -> 'Skip delegation, report directly'
+  - 'Refactor to early returns, extract Config class' -> 'Refactor to early returns'
+  - Remove redundant words: 'in order to' -> 'to', 'that is' -> ''
+- MD060 (table style): Add spaces around ALL pipes in separator rows:
+  - WRONG: |--------|------|
+  - RIGHT: | ------ | ---- |
+- Tables: When shortening, preserve meaning. Abbreviate consistently.
+
+RULES:
+1. Use targeted Edit operations - fix specific lines, never rewrite entire file
+2. For tables: edit the ENTIRE row in one Edit to keep columns consistent
+3. Run: ${format_cmd}
+4. Verify with: markdownlint-cli2 --no-globs '${fp}'
+
+Be concise. No explanations in the file."
+  elif [[ "${ftype}" == "python" ]] && echo "${violations_json}" | jaq -e '[.[] | select(.code | startswith("D"))] | length > 0' >/dev/null 2>&1; then
+    # Python with docstring violations - specialized prompt
+    prompt="You are a docstring fixer. Fix ALL docstring violations in ${fp}.
+
+VIOLATIONS:
+${violations_json}
+
+DOCSTRING FIX STRATEGIES:
+- D401 (imperative mood): Change 'Returns the value' -> 'Return the value', 'Gets data' -> 'Get data'
+- D417 (missing Args): Add Args section with parameter descriptions from function signature
+- D205 (blank line): Add blank line after one-line summary
+- D400/D415 (trailing punctuation): Add period at end of first line
+- D301 (backslash): Use raw docstring r\"\"\" for regex patterns
+- D100/D104 (module/package): Add module-level docstring at file start
+- D107 (__init__): Add docstring explaining initialization parameters
+
+RULES:
+1. Use targeted Edit operations - fix specific docstrings, never rewrite entire file
+2. Preserve existing docstring content, only fix the specific violation
+3. Follow Google docstring style (Args:, Returns:, Raises:)
+4. After fixing, run: ${format_cmd}
+5. Verify with: ruff check --select=D '${fp}'
+
+Be concise. Fix docstrings only, do not refactor code."
+  else
+    # Generic prompt for other file types
+    prompt="You are a code quality fixer. Fix ALL violations listed below in ${fp}.
+
+VIOLATIONS:
+${violations_json}
+
+RULES:
+1. Use targeted Edit operations only - never rewrite the entire file
+2. Fix each violation at its reported line/column
+3. After fixing, run the formatter: ${format_cmd}
+4. Verify by re-running the linter
+5. If a violation cannot be fixed, explain why
+
+Do not add comments explaining fixes. Do not refactor beyond what's needed."
+  fi
+
+  # Find claude binary
+  local claude_cmd=""
+  if command -v claude >/dev/null 2>&1; then
+    claude_cmd="claude"
+  else
+    # Search in common locations
+    local search_dirs="${HOME}/.local/bin ${HOME}/.npm-global/bin /usr/local/bin"
+    for dir in ${search_dirs}; do
+      if [[ -x "${dir}/claude" ]]; then
+        claude_cmd="${dir}/claude"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${claude_cmd}" ]]; then
+    echo "[hook:error] claude binary not found, cannot delegate" >&2
+    return 1
+  fi
+
+
+  # Validate no-hooks settings file exists
+  local settings_file="${HOME}/.claude/no-hooks-settings.json"
+  if [[ ! -f "${settings_file}" ]]; then
+    # Auto-create minimal settings file to prevent recursion
+    # Uses atomic mktemp+mv pattern to handle concurrent hook invocations
+    mkdir -p "${HOME}/.claude"
+    local tmpfile
+    tmpfile=$(mktemp "${settings_file}.XXXXXX") || {
+      echo "[hook:error] failed to create temp file for settings" >&2
+      return 1
+    }
+    cat > "${tmpfile}" << 'SETTINGS_EOF'
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "disableAllHooks": true
+}
+SETTINGS_EOF
+    if mv "${tmpfile}" "${settings_file}" 2>/dev/null; then
+      echo "[hook:warning] created missing ${settings_file}" >&2
+    else
+      rm -f "${tmpfile}"  # Lost race - another process created it first
+    fi
+  fi
+  # Use timeout if available (requires GNU coreutils on macOS: brew install coreutils)
+  local timeout_cmd=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd="timeout ${SUBPROCESS_TIMEOUT}"
+  fi
+
+  # Spawn subprocess and capture exit code
+  # Design choice: Capture and log errors instead of silent || true per ShellCheck
+  # best practices (SC2155, SC2312). Logging provides visibility; hook continues
+  # regardless because subprocess failure is non-fatal (verification step follows).
+  # Use no-hooks settings to prevent recursive hook invocation
+  ${timeout_cmd} "${claude_cmd}" -p "${prompt}" \
+    --settings "${HOME}/.claude/no-hooks-settings.json" \
+    --allowedTools "Edit,Read,Bash" \
+    --max-turns 10 \
+    --model "${model}" \
+    "${fp}" >/dev/null 2>&1
+  subprocess_exit=$?
+
+  # Report subprocess failures (but don't fail the hook)
+  if [[ "${subprocess_exit}" -ne 0 ]]; then
+    if [[ "${subprocess_exit}" -eq 124 ]]; then
+      echo "[hook:warning] subprocess timed out (exit ${subprocess_exit})" >&2
+    else
+      echo "[hook:warning] subprocess failed (exit ${subprocess_exit})" >&2
+    fi
+  fi
+}
+
+# Re-run Phase 1 auto-fix for a file type
+rerun_phase1() {
+  local fp="$1"
+  local ftype="$2"
+
+  case "${ftype}" in
+    python)
+      command -v ruff >/dev/null 2>&1 && {
+        ruff format --quiet "${fp}" >/dev/null 2>&1 || true
+        ruff check --fix --quiet "${fp}" >/dev/null 2>&1 || true
+      }
+      ;;
+    shell)
+      command -v shfmt >/dev/null 2>&1 && {
+        shfmt -w -i 2 -ci -bn "${fp}" 2>/dev/null || true
+      }
+      ;;
+    toml)
+      command -v taplo >/dev/null 2>&1 && {
+        RUST_LOG=error taplo fmt "${fp}" 2>/dev/null || true
+      }
+      ;;
+    markdown)
+      command -v markdownlint-cli2 >/dev/null 2>&1 && {
+        markdownlint-cli2 --no-globs --fix "${fp}" 2>/dev/null || true
+      }
+      ;;
+    json)
+      # Re-validate and pretty-print if valid (use mktemp for safety)
+      if jaq empty "${fp}" 2>/dev/null; then
+        local tmp_file
+        tmp_file=$(mktemp) || return
+        if jaq '.' "${fp}" >"${tmp_file}" 2>/dev/null; then
+          if ! cmp -s "${fp}" "${tmp_file}"; then
+            mv "${tmp_file}" "${fp}"
+          else
+            rm -f "${tmp_file}"
+          fi
+        else
+          rm -f "${tmp_file}"
+        fi
+      fi
+      ;;
+    *) ;; # No Phase 1 for yaml, dockerfile
+  esac
+}
+
+# Re-run Phase 2 and return violation count
+rerun_phase2() {
+  local fp="$1"
+  local ftype="$2"
+  local count=0
+
+  case "${ftype}" in
+    python)
+      # Ruff violations
+      local v
+      v=$(ruff check --preview --output-format=json "${fp}" 2>/dev/null || echo "[]")
+      count=$(echo "${v}" | jaq 'length' 2>/dev/null || echo "0")
+
+      # ty violations (uv run for project venv)
+      if command -v uv >/dev/null 2>&1; then
+        local ty_out
+        ty_out=$(uv run ty check --output-format gitlab "${fp}" 2>/dev/null || echo "[]")
+        local ty_count
+        ty_count=$(echo "${ty_out}" | jaq 'length' 2>/dev/null || echo "0")
+        count=$((count + ty_count))
+      fi
+
+      # flake8-pydantic violations (uv run for project venv)
+      if command -v uv >/dev/null 2>&1; then
+        local pyd_out
+        pyd_out=$(uv run flake8 --select=PYD "${fp}" 2>/dev/null || true)
+        if [[ -n "${pyd_out}" ]]; then
+          local pyd_count
+          pyd_count=$(echo "${pyd_out}" | wc -l | tr -d ' ')
+          count=$((count + pyd_count))
+        fi
+      fi
+
+      # vulture violations
+      if command -v uv >/dev/null 2>&1; then
+        local vulture_out
+        vulture_out=$(uv run vulture "${fp}" --min-confidence 80 2>/dev/null || true)
+        if [[ -n "${vulture_out}" ]]; then
+          local vulture_count
+          vulture_count=$(echo "${vulture_out}" | wc -l | tr -d ' ')
+          count=$((count + vulture_count))
+        fi
+      fi
+
+      # bandit violations
+      if command -v uv >/dev/null 2>&1; then
+        local bandit_out
+        bandit_out=$(uv run bandit -f json -q "${fp}" 2>/dev/null || echo '{"results":[]}')
+        local bandit_count
+        bandit_count=$(echo "${bandit_out}" | jaq '.results | length // 0' 2>/dev/null || echo "0")
+        count=$((count + bandit_count))
+      fi
+
+      # flake8-async violations
+      if command -v uv >/dev/null 2>&1; then
+        local async_out
+        async_out=$(uv run flake8 --select=ASYNC "${fp}" 2>/dev/null || true)
+        if [[ -n "${async_out}" ]]; then
+          local async_count
+          async_count=$(echo "${async_out}" | wc -l | tr -d ' ')
+          count=$((count + async_count))
+        fi
+      fi
+      ;;
+    shell)
+      if command -v shellcheck >/dev/null 2>&1; then
+        local v
+        v=$(shellcheck -f json "${fp}" 2>/dev/null || echo "[]")
+        count=$(echo "${v}" | jaq 'length' 2>/dev/null || echo "0")
+      fi
+      ;;
+    yaml)
+      if command -v yamllint >/dev/null 2>&1; then
+        local v
+        v=$(yamllint -f parsable "${fp}" 2>/dev/null || true)
+        [[ -n "${v}" ]] && count=$(echo "${v}" | wc -l | tr -d ' ')
+      fi
+      ;;
+    json)
+      # Check syntax only
+      if ! jaq empty "${fp}" 2>/dev/null; then
+        count=1
+      fi
+      ;;
+    toml)
+      if command -v taplo >/dev/null 2>&1; then
+        local v
+        v=$(RUST_LOG=error taplo check "${fp}" 2>&1) || true
+        [[ -n "${v}" ]] && count=1
+      fi
+      ;;
+    markdown)
+      if command -v markdownlint-cli2 >/dev/null 2>&1; then
+        local v
+        v=$(markdownlint-cli2 --no-globs "${fp}" 2>&1 || true)
+        if [[ -n "${v}" ]] && ! echo "${v}" | grep -q "Summary: 0 error"; then
+          count=$(echo "${v}" | grep -c ":" || echo "1")
+        fi
+      fi
+      ;;
+    dockerfile)
+      if command -v hadolint >/dev/null 2>&1; then
+        local v
+        v=$(hadolint --no-color -f json "${fp}" 2>/dev/null || echo "[]")
+        count=$(echo "${v}" | jaq 'length' 2>/dev/null || echo "0")
+      fi
+      ;;
+    *) ;; # Unknown file type
+  esac
+
+  echo "${count}"
+}
+
+# Determine file type for delegation
+# NOTE: .github/workflows/*.yml files are handled as generic YAML (yamllint only).
+# Full GitHub Actions validation (actionlint, check-jsonschema) runs at commit-time
+# via pre-commit, not here. Rationale: workflow files are rarely edited during
+# Claude sessions; yamllint covers syntax; specialized validation at commit-time.
+case "${file_path}" in
+  *.py) file_type="python" ;;
+  *.sh | *.bash) file_type="shell" ;;
+  *.yml | *.yaml) file_type="yaml" ;;
+  *.json) file_type="json" ;;
+  *.toml) file_type="toml" ;;
+  *.md | *.mdx) file_type="markdown" ;;
+  Dockerfile | Dockerfile.* | */Dockerfile | */Dockerfile.* | *.dockerfile) file_type="dockerfile" ;;
+  *) exit 0 ;; # Unsupported
+esac
+
+# Determine file type and run appropriate linter
+case "${file_path}" in
+  *.py)
+    is_language_enabled "python" || exit 0
+
+    # Python: Phase 1 - Auto-format and auto-fix (silent)
+    if is_auto_format_enabled && command -v ruff >/dev/null 2>&1; then
+      # Format code (spacing, quotes, line length) - suppress all output
+      ruff format --quiet "${file_path}" >/dev/null 2>&1 || true
+      # Auto-fix linting issues (unused imports, sorting, blank lines) - suppress all output
+      ruff check --fix --quiet "${file_path}" >/dev/null 2>&1 || true
+    fi
+
+    # Python: Phase 2 - Collect unfixable issues per pyproject.toml config
+    # Note: No --select override - pyproject.toml is single source of truth
+    ruff_violations=$(ruff check --preview --output-format=json "${file_path}" 2>/dev/null || true)
+    if [[ -n "${ruff_violations}" ]] && [[ "${ruff_violations}" != "[]" ]]; then
+      # Add linter tag and merge into collected_violations
+      collected_violations=$(echo "${collected_violations}" "${ruff_violations}" \
+        | jaq -s '.[0] + (.[1] | map(. + {linter: "ruff"}))')
+      has_issues=true
+    fi
+
+    # Python: Phase 2b - Type checking with ty (complementary to ruff)
+    # NOTE: Line numbers may differ from source due to ruff format running
+    # first. This is expected - the location still helps identify the issue.
+    # Uses uv run to leverage project's venv (thin wrapper principle)
+    if command -v uv >/dev/null 2>&1; then
+      ty_output=$(uv run ty check --output-format gitlab "${file_path}" \
+        2>/dev/null || true)
+      if [[ -n "${ty_output}" ]] && [[ "${ty_output}" != "[]" ]]; then
+        # Convert ty gitlab format to standard format and merge
+        ty_converted=$(echo "${ty_output}" | jaq '[.[] | {
+          line: .location.positions.begin.line,
+          column: .location.positions.begin.column,
+          code: .check_name,
+          message: .description,
+          linter: "ty"
+        }]')
+        collected_violations=$(echo "${collected_violations}" "${ty_converted}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+
+    # Python: Phase 2c - Duplicate detection (advisory, session-scoped)
+    # Only runs once per session after 3+ Python files modified
+    jscpd_session="/tmp/.jscpd_session_${PPID}"
+    echo "${file_path}" >>"${jscpd_session}" 2>/dev/null || true
+
+    if [[ -f "${jscpd_session}" ]]; then
+      jscpd_count=$(wc -l <"${jscpd_session}" 2>/dev/null | tr -d ' ')
+      if [[ "${jscpd_count}" -ge 3 ]] && [[ ! -f "${jscpd_session}.done" ]]; then
+        touch "${jscpd_session}.done"
+        if command -v npx >/dev/null 2>&1; then
+          jscpd_result=$(npx jscpd --config .jscpd.json --reporters json \
+            --silent 2>/dev/null || true)
+          if [[ -n "${jscpd_result}" ]]; then
+            # jscpd 4.0.7+ uses .statistics; older versions use .statistic (fallback chain)
+            clone_count=$(echo "${jscpd_result}" \
+              | jaq -r 'if .statistics then .statistics.total.clones else if .statistic then .statistic.total.clones else 0 end end' 2>/dev/null || echo "0")
+            if [[ "${clone_count}" -gt 0 ]]; then
+              {
+                echo ""
+                echo "[hook:advisory] Duplicate code detected"
+                echo "Clone pairs found: ${clone_count}"
+                echo ""
+                echo "Run 'npx jscpd --config .jscpd.json' for details."
+                echo ""
+              } >&2
+              # Advisory only - does NOT set has_issues=true
+            fi
+          fi
+        fi
+      fi
+    fi
+
+    # Python: Phase 2d - Pydantic model linting with flake8-pydantic
+    # Note: Uses .flake8 config for per-file-ignores
+    # Uses uv run to leverage project's venv (thin wrapper principle)
+    if command -v uv >/dev/null 2>&1; then
+      pydantic_output=$(uv run flake8 --select=PYD "${file_path}" 2>/dev/null || true)
+      if [[ -n "${pydantic_output}" ]]; then
+        # Convert flake8 output to JSON format (file:line:col: CODE message)
+        # shellcheck disable=SC2016
+        pyd_json=$(echo "${pydantic_output}" | while IFS= read -r line; do
+          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
+          code=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
+          jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \
+            '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-pydantic"}'
+        done | jaq -s '.')
+        [[ -n "${pyd_json}" ]] && collected_violations=$(echo "${collected_violations}" "${pyd_json}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+
+    # Python: Phase 2e - Dead code detection with vulture
+    # Detects unused functions, variables, classes. Config in pyproject.toml [tool.vulture].
+    # Skip excluded paths (tests, scripts, etc.) to avoid false positives
+    _excluded_vulture=false
+    # shellcheck disable=SC2310  # Intentionally capturing return value, not propagating errors
+    is_excluded_from_security_linters "${file_path}" && _vulture_rc=0 || _vulture_rc=$?
+    if [[ ${_vulture_rc} -eq 0 ]]; then _excluded_vulture=true; fi
+    if ! "${_excluded_vulture}" && command -v uv >/dev/null 2>&1; then
+      vulture_output=$(uv run vulture "${file_path}" --min-confidence 80 2>/dev/null || true)
+      if [[ -n "${vulture_output}" ]]; then
+        # Convert vulture output to JSON (file:line: message pattern)
+        # shellcheck disable=SC2016
+        vulture_json=$(echo "${vulture_output}" | while IFS= read -r line; do
+          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+): .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+: (.*)/\1/')
+          jaq -n --arg l "${line_num}" --arg m "${msg}" \
+            '{line:($l|tonumber),column:1,code:"VULTURE",message:$m,linter:"vulture"}'
+        done | jaq -s '.')
+        [[ -n "${vulture_json}" ]] && [[ "${vulture_json}" != "[]" ]] && \
+          collected_violations=$(echo "${collected_violations}" "${vulture_json}" \
+            | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+
+    # Python: Phase 2f - Security scanning with bandit
+    # Detects common security issues (hardcoded passwords, SQL injection, etc.)
+    # Skip excluded paths (tests, scripts, etc.) to avoid false positives
+    _excluded_bandit=false
+    # shellcheck disable=SC2310  # Intentionally capturing return value, not propagating errors
+    is_excluded_from_security_linters "${file_path}" && _bandit_rc=0 || _bandit_rc=$?
+    if [[ ${_bandit_rc} -eq 0 ]]; then _excluded_bandit=true; fi
+    if ! "${_excluded_bandit}" && command -v uv >/dev/null 2>&1; then
+      bandit_output=$(uv run bandit -f json -q "${file_path}" 2>/dev/null || echo '{"results":[]}')
+      bandit_results=$(echo "${bandit_output}" | jaq '.results // []' 2>/dev/null || echo "[]")
+      if [[ "${bandit_results}" != "[]" ]] && [[ "${bandit_results}" != "null" ]]; then
+        # Convert bandit JSON to standard format
+        bandit_converted=$(echo "${bandit_results}" | jaq '[.[] | {
+          line: .line_number,
+          column: (.col_offset // 1),
+          code: .test_id,
+          message: .issue_text,
+          linter: "bandit"
+        }]')
+        [[ -n "${bandit_converted}" ]] && [[ "${bandit_converted}" != "[]" ]] && \
+          collected_violations=$(echo "${collected_violations}" "${bandit_converted}" \
+            | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+
+    # Python: Phase 2g - Async pattern linting with flake8-async
+    # Detects missing await checkpoints, timeout parameter issues, etc.
+    if command -v uv >/dev/null 2>&1; then
+      async_output=$(uv run flake8 --select=ASYNC "${file_path}" 2>/dev/null || true)
+      if [[ -n "${async_output}" ]]; then
+        # shellcheck disable=SC2016
+        async_json=$(echo "${async_output}" | while IFS= read -r line; do
+          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
+          code=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
+          jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" \
+            --arg m "${msg}" \
+            '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-async"}'
+        done | jaq -s '.')
+        [[ -n "${async_json}" ]] && collected_violations=$(echo "${collected_violations}" \
+          "${async_json}" | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+
+  *.sh | *.bash)
+    is_language_enabled "shell" || exit 0
+
+    # Shell: Phase 1 - Auto-format with shfmt
+    if is_auto_format_enabled && command -v shfmt >/dev/null 2>&1; then
+      # Format shell script (indentation, spacing)
+      # Using -i 2 for 2-space indent, -ci for case indent, -bn for binary ops
+      shfmt -w -i 2 -ci -bn "${file_path}" 2>/dev/null || true
+    fi
+
+    # Shell: Phase 2 - Collect semantic issues with ShellCheck
+    if command -v shellcheck >/dev/null 2>&1; then
+      shellcheck_output=$(shellcheck -f json "${file_path}" 2>/dev/null || true)
+      if [[ -n "${shellcheck_output}" ]] && [[ "${shellcheck_output}" != "[]" ]]; then
+        # Convert shellcheck JSON to standard format and merge
+        sc_converted=$(echo "${shellcheck_output}" | jaq '[.[] | {
+          line: .line,
+          column: .column,
+          code: ("SC" + (.code | tostring)),
+          message: .message,
+          linter: "shellcheck"
+        }]')
+        collected_violations=$(echo "${collected_violations}" "${sc_converted}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+
+  *.yml | *.yaml)
+    is_language_enabled "yaml" || exit 0
+
+    # YAML: yamllint - collect all issues
+    if command -v yamllint >/dev/null 2>&1; then
+      yamllint_output=$(yamllint -f parsable "${file_path}" 2>/dev/null || true)
+      if [[ -n "${yamllint_output}" ]]; then
+        # Convert yamllint parsable format to JSON (file:line:col: [level] message (code))
+        # shellcheck disable=SC2016
+        yaml_json=$(echo "${yamllint_output}" | while IFS= read -r line; do
+          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/.*\[[a-z]+\] ([^(]+).*/\1/' | sed 's/ *$//')
+          code=$(echo "${line}" | sed -E 's/.*\(([^)]+)\).*/\1/' || echo "unknown")
+          jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \
+            '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"yamllint"}'
+        done | jaq -s '.')
+        [[ -n "${yaml_json}" ]] && collected_violations=$(echo "${collected_violations}" "${yaml_json}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+
+  *.json)
+    is_language_enabled "json" || exit 0
+
+    # JSON: Phase 1 - Validate syntax first
+    json_error=$(jaq empty "${file_path}" 2>&1) || true
+    if [[ -n "${json_error}" ]]; then
+      # Collect JSON syntax error
+      # shellcheck disable=SC2016 # $m is a jaq variable, not shell
+      json_violation=$(jaq -n --arg m "${json_error}" \
+        '[{line:1,column:1,code:"JSON_SYNTAX",message:$m,linter:"jaq"}]')
+      collected_violations=$(echo "${collected_violations}" "${json_violation}" \
+        | jaq -s '.[0] + .[1]')
+      has_issues=true
+    else
+      # JSON: Phase 2 - Auto-format valid JSON (pretty-print) (use mktemp for safety)
+      if is_auto_format_enabled; then
+        tmp_file=$(mktemp) || true
+        if [[ -n "${tmp_file}" ]] && jaq '.' "${file_path}" >"${tmp_file}" 2>/dev/null; then
+          if ! cmp -s "${file_path}" "${tmp_file}"; then
+            mv "${tmp_file}" "${file_path}"
+          else
+            rm -f "${tmp_file}"
+          fi
+        else
+          rm -f "${tmp_file}" 2>/dev/null || true
+        fi
+      fi
+    fi
+    ;;
+
+  Dockerfile | Dockerfile.* | */Dockerfile | */Dockerfile.* | *.dockerfile)
+    is_language_enabled "dockerfile" || exit 0
+
+    # Dockerfile: hadolint - collect all issues
+    # Requires hadolint >= 2.12.0 for disable-ignore-pragma support
+    if command -v hadolint >/dev/null 2>&1; then
+      # Version check (warn if too old, don't block)
+      hadolint_version=$(hadolint --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+      if [[ -n "${hadolint_version}" ]]; then
+        major="${hadolint_version%%.*}"
+        minor="${hadolint_version#*.}"
+        if [[ "${major}" -lt 2 ]] || { [[ "${major}" -eq 2 ]] && [[ "${minor}" -lt 12 ]]; }; then
+          echo "[hook:warning] hadolint ${hadolint_version} < 2.12.0 (some features may not work)" >&2
+        fi
+      fi
+      hadolint_output=$(hadolint --no-color -f json "${file_path}" 2>/dev/null || true)
+      if [[ -n "${hadolint_output}" ]] && [[ "${hadolint_output}" != "[]" ]]; then
+        # Convert hadolint JSON to standard format and merge
+        hl_converted=$(echo "${hadolint_output}" | jaq '[.[] | {
+          line: .line,
+          column: .column,
+          code: .code,
+          message: .message,
+          linter: "hadolint"
+        }]')
+        collected_violations=$(echo "${collected_violations}" "${hl_converted}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+
+  *.toml)
+    is_language_enabled "toml" || exit 0
+
+    # NOTE: taplo.toml include pattern limits validation to project files.
+    # Files outside project directory are silently excluded (known design).
+    # TOML: Phase 1 - Auto-format
+    if is_auto_format_enabled && command -v taplo >/dev/null 2>&1; then
+      # Format TOML in-place (fixes spacing, alignment)
+      RUST_LOG=error taplo fmt "${file_path}" 2>/dev/null || true
+    fi
+
+    if command -v taplo >/dev/null 2>&1; then
+      # TOML: Phase 2 - Check for syntax errors (can't be auto-fixed)
+      taplo_check=$(RUST_LOG=error taplo check "${file_path}" 2>&1) || true
+      if [[ -n "${taplo_check}" ]]; then
+        # Collect TOML syntax error
+        # shellcheck disable=SC2016
+        toml_violation=$(jaq -n --arg m "${taplo_check}" \
+          '[{line:1,column:1,code:"TOML_SYNTAX",message:$m,linter:"taplo"}]')
+        collected_violations=$(echo "${collected_violations}" "${toml_violation}" \
+          | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+
+  *.md | *.mdx)
+    is_language_enabled "markdown" || exit 0
+
+    # Markdown: Phase 1 - Auto-fix what we can
+    if command -v markdownlint-cli2 >/dev/null 2>&1; then
+      # --no-globs: Disable config globs, lint only the specific file
+      # Without this, markdownlint merges globs from .markdownlint-cli2.jsonc
+      # noBanner+noProgress in .markdownlint-cli2.jsonc suppress verbose output
+      # Phase 1: Auto-fix (silently fixes what it can, outputs only unfixable issues)
+      if is_auto_format_enabled; then
+        markdownlint-cli2 --no-globs --fix "${file_path}" >/dev/null 2>&1 || true
+      fi
+
+      # Phase 2: Collect remaining unfixable issues for delegation
+      markdownlint_output=$(markdownlint-cli2 --no-globs "${file_path}" 2>&1 || true)
+
+      # Count remaining violations (lines matching file:line pattern)
+      # grep -c exits 1 on no matches but still outputs 0, so use || true to ignore exit code
+      violation_count=$(echo "${markdownlint_output}" | grep -cE "^[^:]+:[0-9]+" || true)
+      [[ -z "${violation_count}" ]] && violation_count=0
+
+      # Brief summary output - only if violations remain after auto-fix
+      if [[ "${violation_count}" -gt 0 ]]; then
+        echo >&2 "[hook] Markdown: ${violation_count} unfixable issue(s) collected"
+      fi
+
+      # Only collect if there are actual errors
+      if [[ -n "${markdownlint_output}" ]] && ! echo "${markdownlint_output}" | grep -q "Summary: 0 error"; then
+        # Convert markdownlint output to JSON (file:line:col MD### message)
+        # shellcheck disable=SC2016
+        md_json=$(echo "${markdownlint_output}" | grep -E "^[^:]+:[0-9]+" | while IFS= read -r line; do
+          line_num=$(echo "${line}" | sed -E 's/[^:]+:([0-9]+).*/\1/')
+          code=$(echo "${line}" | sed -E 's/.*[[:space:]](MD[0-9]+).*/\1/' || echo "MD000")
+          msg=$(echo "${line}" | sed -E 's/.*MD[0-9]+[^[:alnum:]]*(.+)/\1/' | sed 's/^ *//')
+          jaq -n --arg l "${line_num}" --arg cd "${code}" --arg m "${msg}" \
+            '{line:($l|tonumber),column:1,code:$cd,message:$m,linter:"markdownlint"}'
+        done | jaq -s '.')
+        [[ -n "${md_json}" ]] && [[ "${md_json}" != "[]" ]] \
+          && collected_violations=$(echo "${collected_violations}" "${md_json}" \
+            | jaq -s '.[0] + .[1]')
+        has_issues=true
+      fi
+    fi
+    ;;
+  *)
+    # Unsupported file type - no linting available
+    ;;
+esac
+
+# ============================================================================
+# DELEGATION AND EXIT LOGIC
+# ============================================================================
+
+# If no issues, exit clean
+if [[ "${has_issues}" = false ]]; then
+  exit 0
+fi
+
+# Calculate model selection for debugging/testing
+# This runs before HOOK_SKIP_SUBPROCESS check so tests can verify model selection
+if [[ "${HOOK_DEBUG_MODEL:-}" == "1" ]]; then
+  count=$(echo "${collected_violations}" | jaq 'length' 2>/dev/null || echo "0")
+
+  debug_has_opus_codes="false"
+  if echo "${collected_violations}" | jaq -e '[.[] | select(.code | test("'"${OPUS_CODE_PATTERN}"'"))] | length > 0' >/dev/null 2>&1; then
+    debug_has_opus_codes="true"
+  fi
+
+  debug_has_sonnet_codes="false"
+  if echo "${collected_violations}" | jaq -e '[.[] | select(.code | test("'"${SONNET_CODE_PATTERN}"'"))] | length > 0' >/dev/null 2>&1; then
+    debug_has_sonnet_codes="true"
+  fi
+
+  debug_model="haiku"
+  if [[ "${debug_has_sonnet_codes}" == "true" ]]; then
+    debug_model="sonnet"
+  fi
+  if [[ "${debug_has_opus_codes}" == "true" ]] || [[ "${count}" -gt "${VOLUME_THRESHOLD}" ]]; then
+    debug_model="opus"
+  fi
+
+  echo "[hook:model] ${debug_model}" >&2
+fi
+
+# Testing mode: skip subprocess and report violations directly
+# Usage: HOOK_SKIP_SUBPROCESS=1 ./multi_linter.sh
+if [[ "${HOOK_SKIP_SUBPROCESS:-}" == "1" ]]; then
+  echo "[hook] ${collected_violations}" >&2
+  exit 2
+fi
+
+# Delegate to subprocess to fix violations
+if is_subprocess_enabled && [[ -z "${HOOK_SKIP_SUBPROCESS:-}" ]]; then
+  spawn_fix_subprocess "${file_path}" "${collected_violations}" "${file_type}"
+fi
+
+# Verify: re-run Phase 1 + Phase 2
+rerun_phase1 "${file_path}" "${file_type}"
+remaining=$(rerun_phase2 "${file_path}" "${file_type}")
+
+if [[ "${remaining}" -eq 0 ]]; then
+  exit 0 # Fixed successfully
+else
+  echo "[hook] ${remaining} violation(s) remain after delegation" >&2
+  exit 2
+fi
