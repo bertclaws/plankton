@@ -26,8 +26,16 @@
 
 set -euo pipefail
 
+# Fail-open if jaq is not installed (required for JSON parsing)
+if ! command -v jaq >/dev/null 2>&1; then
+  echo "[hook] error: jaq is required but not found. Install: brew install jaq" >&2
+  exit 0
+fi
+
 # ============================================================================
 # CONFIGURATION LOADING
+# Session PID for temp file scoping (override with HOOK_SESSION_PID for testing)
+SESSION_PID="${HOOK_SESSION_PID:-${PPID}}"
 # ============================================================================
 
 # Load configuration from config.json (falls back to all-enabled if missing)
@@ -44,7 +52,7 @@ load_config() {
 is_language_enabled() {
   local lang="$1"
   local enabled
-  enabled=$(echo "${CONFIG_JSON}" | jaq -r ".languages.${lang} // true" 2>/dev/null)
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r ".languages.${lang}" 2>/dev/null)
   [[ "${enabled}" != "false" ]]
 }
 
@@ -58,23 +66,26 @@ get_exclusions() {
 load_model_patterns() {
   local default_sonnet='C901|PLR[0-9]+|PYD[0-9]+|FAST[0-9]+|ASYNC[0-9]+|unresolved-import|MD[0-9]+|D[0-9]+'
   local default_opus='unresolved-attribute|type-assertion'
-  SONNET_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.sonnet_patterns // \"${default_sonnet}\"" 2>/dev/null)
-  OPUS_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.opus_patterns // \"${default_opus}\"" 2>/dev/null)
-  VOLUME_THRESHOLD=$(echo "${CONFIG_JSON}" | jaq -r ".subprocess.model_selection.volume_threshold // 5" 2>/dev/null)
+  SONNET_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.model_selection.sonnet_patterns // empty' 2>/dev/null) || true
+  [[ -z "${SONNET_CODE_PATTERN}" ]] && SONNET_CODE_PATTERN="${default_sonnet}"
+  OPUS_CODE_PATTERN=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.model_selection.opus_patterns // empty' 2>/dev/null) || true
+  [[ -z "${OPUS_CODE_PATTERN}" ]] && OPUS_CODE_PATTERN="${default_opus}"
+  VOLUME_THRESHOLD=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.model_selection.volume_threshold // empty' 2>/dev/null) || true
+  [[ -z "${VOLUME_THRESHOLD}" ]] && VOLUME_THRESHOLD=5
   readonly SONNET_CODE_PATTERN OPUS_CODE_PATTERN VOLUME_THRESHOLD
 }
 
 # Check if auto-format phase is enabled (default: true)
 is_auto_format_enabled() {
   local enabled
-  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.auto_format // true' 2>/dev/null)
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.auto_format' 2>/dev/null)
   [[ "${enabled}" != "false" ]]
 }
 
 # Check if subprocess delegation is enabled (default: true)
 is_subprocess_enabled() {
   local enabled
-  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.subprocess_delegation // true' 2>/dev/null)
+  enabled=$(echo "${CONFIG_JSON}" | jaq -r '.phases.subprocess_delegation' 2>/dev/null)
   [[ "${enabled}" != "false" ]]
 }
 
@@ -102,7 +113,7 @@ get_ts_config() {
 
 # Detect Biome binary with session caching (D8)
 detect_biome() {
-  local cache_file="/tmp/.biome_path_${PPID}"
+  local cache_file="/tmp/.biome_path_${SESSION_PID}"
 
   # Check session cache first
   if [[ -f "${cache_file}" ]]; then
@@ -151,6 +162,11 @@ detect_biome() {
 
 # Initialize configuration
 load_config
+
+# Master kill switch: hook_enabled=false in config.json disables all linting
+if [[ "$(echo "${CONFIG_JSON}" | jaq -r '.hook_enabled' 2>/dev/null)" == "false" ]]; then
+  exit 0
+fi
 load_model_patterns
 
 # Read JSON input from stdin
@@ -166,7 +182,8 @@ collected_violations="[]"
 file_type=""
 
 # Subprocess timeout: config.json -> env var -> 300s default
-_config_timeout=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.timeout // 300' 2>/dev/null)
+_config_timeout=$(echo "${CONFIG_JSON}" | jaq -r '.subprocess.timeout // empty' 2>/dev/null) || true
+[[ -z "${_config_timeout}" ]] && _config_timeout=300
 readonly SUBPROCESS_TIMEOUT="${HOOK_SUBPROCESS_TIMEOUT:-${_config_timeout}}"
 
 # Extract file path from tool_input
@@ -228,6 +245,7 @@ spawn_fix_subprocess() {
   fi
 
   # Select model: haiku (simple) -> sonnet (medium) -> opus (complex or >threshold violations)
+  # Volume threshold: > VOLUME_THRESHOLD triggers opus (default >5, i.e. 6+ violations)
   local model="haiku"
   if [[ "${has_sonnet_codes}" == "true" ]]; then
     model="sonnet"
@@ -586,7 +604,7 @@ rerun_phase2() {
         local biome_out
         biome_out=$( (cd "${CLAUDE_PROJECT_DIR:-.}" && ${_biome_cmd} lint --reporter=json "$(_biome_relpath "${fp}")") 2>/dev/null || true)
         if [[ -n "${biome_out}" ]]; then
-          count=$(echo "${biome_out}" | jaq '[.diagnostics[] |
+          count=$(echo "${biome_out}" | jaq '[(.diagnostics // [])[] |
             select(.severity == "error" or .severity == "warning")] | length' 2>/dev/null || echo "0")
         fi
       fi
@@ -608,7 +626,7 @@ _handle_semgrep_session() {
   semgrep_enabled=$(get_ts_config "semgrep" "true")
   [[ "${semgrep_enabled}" == "false" ]] && return
 
-  local session_file="/tmp/.semgrep_session_${PPID}"
+  local session_file="/tmp/.semgrep_session_${SESSION_PID}"
   echo "${fp}" >>"${session_file}" 2>/dev/null || true
 
   if [[ -f "${session_file}" ]]; then
@@ -643,7 +661,7 @@ _handle_semgrep_session() {
 # jscpd session-scoped helper for TypeScript (D17)
 _handle_jscpd_ts_session() {
   local fp="$1"
-  local session_file="/tmp/.jscpd_ts_session_${PPID}"
+  local session_file="/tmp/.jscpd_ts_session_${SESSION_PID}"
   echo "${fp}" >>"${session_file}" 2>/dev/null || true
 
   if [[ -f "${session_file}" ]]; then
@@ -700,6 +718,7 @@ _biome_relpath() {
   if [[ "${abs}" == "${base}/"* ]]; then
     echo "${abs#"${base}/"}"
   else
+    echo "[hook:warning] file outside project root, biome project rules may not apply" >&2
     echo "${abs}"
   fi
 }
@@ -716,7 +735,7 @@ handle_typescript() {
   # SFC handling (D4): .vue/.svelte/.astro -> Semgrep only, skip Biome
   case "${ext}" in
     vue|svelte|astro)
-      local sfc_warned="/tmp/.sfc_warned_${ext}_${PPID}"
+      local sfc_warned="/tmp/.sfc_warned_${ext}_${SESSION_PID}"
       if [[ ! -f "${sfc_warned}" ]]; then
         touch "${sfc_warned}"
         if ! command -v semgrep >/dev/null 2>&1; then
@@ -736,7 +755,7 @@ handle_typescript() {
   fi
 
   # One-time nursery config validation per session
-  local nursery_checked="/tmp/.nursery_checked_${PPID}"
+  local nursery_checked="/tmp/.nursery_checked_${SESSION_PID}"
   if [[ ! -f "${nursery_checked}" ]]; then
     touch "${nursery_checked}"
     _validate_nursery_config "${biome_cmd}"
@@ -775,8 +794,9 @@ handle_typescript() {
       # Convert Biome diagnostics to standard format
       # Biome uses byte offsets in span; convert to line/column via sourceCode
       local biome_violations
-      biome_violations=$(echo "${biome_output}" | jaq '[.diagnostics[] |
+      biome_violations=$(echo "${biome_output}" | jaq '[(.diagnostics // [])[] |
         select(.severity == "error" or .severity == "warning") |
+        select(.location.span != null) |
         {
           line: ((.location.sourceCode[0:.location.span[0]] // "") | split("\n") | length),
           column: (((.location.sourceCode[0:.location.span[0]] // "") | split("\n") | last | length) + 1),
@@ -796,7 +816,7 @@ handle_typescript() {
       nursery_mode=$(get_ts_config "biome_nursery" "warn")
       if [[ "${nursery_mode}" == "warn" ]]; then
         local nursery_count
-        nursery_count=$(echo "${biome_output}" | jaq '[.diagnostics[] |
+        nursery_count=$(echo "${biome_output}" | jaq '[(.diagnostics // [])[] |
           select(.category | startswith("lint/nursery/"))] | length' 2>/dev/null || echo "0")
         if [[ "${nursery_count}" -gt 0 ]]; then
           echo "[hook:advisory] Biome nursery: ${nursery_count} diagnostic(s)" >&2
@@ -877,7 +897,7 @@ case "${file_path}" in
 
     # Python: Phase 2c - Duplicate detection (advisory, session-scoped)
     # Only runs once per session after 3+ Python files modified
-    jscpd_session="/tmp/.jscpd_session_${PPID}"
+    jscpd_session="/tmp/.jscpd_session_${SESSION_PID}"
     echo "${file_path}" >>"${jscpd_session}" 2>/dev/null || true
 
     if [[ -f "${jscpd_session}" ]]; then
@@ -916,10 +936,10 @@ case "${file_path}" in
         # Convert flake8 output to JSON format (file:line:col: CODE message)
         # shellcheck disable=SC2016
         pyd_json=$(echo "${pydantic_output}" | while IFS= read -r line; do
-          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
-          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
-          code=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
-          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
+          line_num=$(echo "${line}" | sed -E 's/^[^:]*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:([0-9]+): .*/\1/')
+          code=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
           jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \
             '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-pydantic"}'
         done | jaq -s '.')
@@ -942,8 +962,8 @@ case "${file_path}" in
         # Convert vulture output to JSON (file:line: message pattern)
         # shellcheck disable=SC2016
         vulture_json=$(echo "${vulture_output}" | while IFS= read -r line; do
-          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+): .*/\1/')
-          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+: (.*)/\1/')
+          line_num=$(echo "${line}" | sed -E 's/^[^:]*:([0-9]+): .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+: (.*)/\1/')
           jaq -n --arg l "${line_num}" --arg m "${msg}" \
             '{line:($l|tonumber),column:1,code:"VULTURE",message:$m,linter:"vulture"}'
         done | jaq -s '.')
@@ -987,10 +1007,10 @@ case "${file_path}" in
       if [[ -n "${async_output}" ]]; then
         # shellcheck disable=SC2016
         async_json=$(echo "${async_output}" | while IFS= read -r line; do
-          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
-          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
-          code=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
-          msg=$(echo "${line}" | sed -E 's/.*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
+          line_num=$(echo "${line}" | sed -E 's/^[^:]*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:([0-9]+): .*/\1/')
+          code=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:[0-9]+: ([A-Z0-9]+) .*/\1/')
+          msg=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:[0-9]+: [A-Z0-9]+ (.*)/\1/')
           jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" \
             --arg m "${msg}" \
             '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-async"}'
@@ -1041,8 +1061,8 @@ case "${file_path}" in
         # Convert yamllint parsable format to JSON (file:line:col: [level] message (code))
         # shellcheck disable=SC2016
         yaml_json=$(echo "${yamllint_output}" | while IFS= read -r line; do
-          line_num=$(echo "${line}" | sed -E 's/.*:([0-9]+):[0-9]+: .*/\1/')
-          col_num=$(echo "${line}" | sed -E 's/.*:[0-9]+:([0-9]+): .*/\1/')
+          line_num=$(echo "${line}" | sed -E 's/^[^:]*:([0-9]+):[0-9]+: .*/\1/')
+          col_num=$(echo "${line}" | sed -E 's/^[^:]*:[0-9]+:([0-9]+): .*/\1/')
           msg=$(echo "${line}" | sed -E 's/.*\[[a-z]+\] ([^(]+).*/\1/' | sed 's/ *$//')
           code=$(echo "${line}" | sed -E 's/.*\(([^)]+)\).*/\1/' || echo "unknown")
           jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \

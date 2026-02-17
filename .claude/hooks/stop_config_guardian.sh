@@ -79,7 +79,7 @@ fi
 # === HASH-BASED GUARD CHECK ===
 # If user previously approved these exact file contents, allow session to end.
 # Guard file stores content hashes; re-prompts if content changed since approval.
-GUARD_FILE="/tmp/stop_hook_approved_${PPID}.json"
+GUARD_FILE="/tmp/stop_hook_approved_${HOOK_GUARD_PID:-${PPID}}.json"
 
 if [[ -f "${GUARD_FILE}" ]]; then
   all_approved=true
@@ -139,7 +139,7 @@ questions: [{
 
 After user responds:
 - If "Keep changes":
-  1. Run: .claude/hooks/approve_configs.sh ${PPID} ${files_list}
+  1. Run: .claude/hooks/approve_configs.sh ${HOOK_GUARD_PID:-${PPID}} ${files_list}
   2. Report "Keeping modified configs per user approval. Guard file created for this session."
 - If "Restore": Run: git checkout -- ${files_list}
 - If "Show diff": Run: git diff -- ${files_list}
