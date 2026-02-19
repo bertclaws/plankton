@@ -13,7 +13,7 @@
     (PreToolUse block + Stop hook recovery)
   - Complexity-based model selection (haiku/sonnet/opus) for subprocess delegation
 - **Languages**: Python, Shell, YAML, JSON, TOML, Markdown, Dockerfile, TypeScript/JS/CSS
-- **Dependencies**: `jaq` + `ruff` required; 15+ optional
+- **Dependencies**: `jaq` + `ruff` required; 20+ optional
   linters skipped if absent
 
 ## Scope & Context
@@ -21,7 +21,8 @@
 - **Goals**: Portable, zero-violation baseline with
   automated enforcement in CC sessions and pre-commit
 - **Non-goals**: Runtime app code; IDE integration
-  beyond Claude Code; custom linter rule authoring
+  beyond Claude Code; custom linter rule authoring;
+  spec review skills (`.claude/spec/`)
 - **Upstream**: Claude Code runtime (hook lifecycle:
   PreToolUse, PostToolUse, Stop); `claude -p` CLI
 - **Downstream**: Adopting projects inherit hooks,
@@ -128,7 +129,7 @@ graph TB
     end
 
     subgraph "CI Layer"
-        PRECOMMIT[.pre-commit-config.yaml<br/>12 Hook Phases]
+        PRECOMMIT[.pre-commit-config.yaml<br/>15 Hook Phases]
         GHA[GitHub Actions<br/>lint + test jobs]
     end
 
@@ -154,7 +155,7 @@ graph TB
 
 ### multi_linter.sh (PostToolUse Hook)
 
-- **Location**: `.claude/hooks/multi_linter.sh` (~1,287 lines)
+- **Location**: `.claude/hooks/multi_linter.sh` (~1,286 lines)
 - **Responsibilities**:
   - Dispatches files to language-specific handlers based on extension
   - Runs three-phase lint: format, collect
@@ -163,8 +164,10 @@ graph TB
   - Selects subprocess model (haiku/sonnet/opus) based on violation codes and count
 - **Implementation**:
   - Reads `config.json` at startup for language toggles, phase control, model patterns
-  - Collects violations into a JSON array with unified `{line, column, code, message, linter}` schema
-  - Spawns `claude -p` with `--settings ~/.claude/no-hooks-settings.json` to prevent recursion
+  - Collects violations into a unified JSON array
+    `{line, column, code, message, linter}`
+  - Spawns `claude -p` with no-hooks settings to
+    prevent recursion
   - Verification pass re-runs Phase 1 + Phase 2 after subprocess exits
 - **Inputs**: stdin JSON `{"tool_input": {"file_path": "..."}}` from Claude Code
 - **Outputs**: Exit 0 (clean) or exit 2 + stderr message (violations remain)
@@ -173,80 +176,133 @@ graph TB
 
 - **Location**: `.claude/hooks/protect_linter_configs.sh` (~87 lines)
 - **Responsibilities**: Blocks Edit/Write on protected config files and hook scripts
-- **Implementation**: Extracts file path from stdin JSON, matches basename against `config.json` protected list or `.claude/` path patterns. Returns `{"decision": "block"}` or `{"decision": "approve"}`
-- **Notes**: Fires on all Edit/Write operations; uses fast-path approval for non-protected files
+- **Implementation**: Extracts file path from stdin
+  JSON, matches against `config.json` protected list
+  or `.claude/` patterns. Returns block or approve
+- **Notes**: Fires on all Edit/Write; fast-path
+  approval for non-protected files
 
 ### stop_config_guardian.sh (Stop Hook)
 
 - **Location**: `.claude/hooks/stop_config_guardian.sh` (~158 lines)
-- **Responsibilities**: Detects modified config files at session end; prompts user via AskUserQuestion to keep or restore
-- **Implementation**: Programmatic detection via `git diff --name-only` (no LLM). Hash-based guard file (`/tmp/stop_hook_approved_${PPID}.json`) prevents re-prompting within same session. Uses `stop_hook_active` flag to prevent infinite loops
-- **Notes**: `approve_configs.sh` helper creates guard file with SHA-256 content hashes
+- **Responsibilities**: Detects modified config files
+  at session end; prompts user to keep or restore
+- **Implementation**: `git diff --name-only` (no LLM).
+  Hash-based guard file prevents re-prompting within
+  session. `stop_hook_active` flag prevents loops
+- **Notes**: `approve_configs.sh` creates guard file
+  with SHA-256 content hashes
 
 ### config.json (Runtime Configuration)
 
 - **Location**: `.claude/hooks/config.json` (~68 lines)
-- **Responsibilities**: Central configuration for all hooks - language toggles, protected files, exclusions, phase control, subprocess model patterns, jscpd settings
-- **Implementation**: Loaded by `load_config()` in `multi_linter.sh`; parsed with `jaq`. Falls back to hardcoded defaults if missing
-- **Notes**: Environment variables (`HOOK_SUBPROCESS_TIMEOUT`, `HOOK_SKIP_SUBPROCESS`) override config values
+- **Responsibilities**: Central config for all hooks -
+  language toggles, protected files, exclusions,
+  phase control, model patterns, jscpd settings
+- **Implementation**: Loaded by `load_config()`;
+  parsed with `jaq`. Falls back to defaults if missing
+- **TypeScript sub-options**: `biome_unsafe_autofix`
+  (unsafe Biome fixes), `oxlint_tsgolint` (oxlint
+  integration), `tsgo` (TypeScript Go compiler),
+  `knip` (dead code detection) - all opt-in
+- **Notes**: Env vars (`HOOK_SUBPROCESS_TIMEOUT`,
+  `HOOK_SKIP_SUBPROCESS`) override config values
 
 ### test_hook.sh (Debug/Test Utility)
 
-- **Location**: `.claude/hooks/test_hook.sh` (~701 lines)
-- **Responsibilities**: Comprehensive self-test suite covering all file types, model selection, TypeScript handling, config protection, and edge cases
-- **Implementation**: `--self-test` flag runs automated tests using temp files with `HOOK_SKIP_SUBPROCESS=1` for deterministic results. Covers ~25 test cases including Dockerfile patterns, styled output, model selection, and TypeScript-specific tests gated on Biome availability
+- **Location**: `.claude/hooks/test_hook.sh` (~700 lines)
+- **Responsibilities**: Self-test suite covering all
+  file types, model selection, TS handling, config
+  protection, and edge cases
+- **Implementation**: `--self-test` runs tests with
+  `HOOK_SKIP_SUBPROCESS=1` for determinism. ~25 cases
+  including Dockerfile, model selection, TS tests
 
 ## Data Model
 
-- **Violation schema**: `{line: number, column: number, code: string, message: string, linter: string}` - unified across all linters
+- **Violation schema**: `{line, column, code,
+  message, linter}` - unified across all linters
 - **Hook input**: `{"tool_input": {"file_path": string}}` from Claude Code via stdin
 - **PreToolUse output**: `{"decision": "approve"|"block", "reason"?: string}`
-- **Stop output**: `{"decision": "approve"|"block", "reason"?: string, "systemMessage"?: string}`
-- **Guard file**: `/tmp/stop_hook_approved_${PPID}.json` with `{approved_at, files: {path: "sha256:hash"}}`
-- **Session markers**: `/tmp/.jscpd_session_${PPID}`, `/tmp/.semgrep_session_${PPID}`, `/tmp/.biome_path_${PPID}`
+- **Stop output**: `{"decision": "approve"|"block",
+  "reason"?, "systemMessage"?}`
+- **Guard file**: `/tmp/stop_hook_approved_${PPID}.json`
+  with `{approved_at, files: {path: "sha256:hash"}}`
+- **Session markers**: PPID-scoped files in `/tmp/`
+  for jscpd, semgrep, and biome path caching
 
 ## Operations
 
-- **Environments**: Template designed for local development with Claude Code; CI via GitHub Actions (`lint` + `test` jobs)
-- **Configuration**: `config.json` for hook behavior; `.claude/settings.json` for hook registration; `.claude/settings.local.json` for personal overrides (gitignored); individual linter config files in project root
-- **Observability**: `HOOK_DEBUG_MODEL=1` outputs model selection; `HOOK_SKIP_SUBPROCESS=1` captures violations without delegation; `claude --debug "hooks" --verbose` for full debug; `--self-test` flag for automated validation
-- **CI/CD**: GitHub Actions runs `uv run pre-commit run --all-files` (lint job) and `uv run pytest tests/` (test job) on push/PR to main
-- **Package management**: `uv` for Python dependencies (`pyproject.toml`); `npm` for Node tools (biome, jscpd, markdownlint-cli2)
+- **Environments**: Local dev with Claude Code;
+  CI via GitHub Actions (`lint` + `test` jobs)
+- **Configuration**: `config.json` for hooks;
+  `.claude/settings.json` for registration;
+  `.claude/settings.local.json` for overrides
+- **Observability**: `HOOK_DEBUG_MODEL=1` for model
+  selection; `HOOK_SKIP_SUBPROCESS=1` skips delegation;
+  `--self-test` for automated validation
+- **CI/CD**: GitHub Actions runs pre-commit (lint)
+  - pytest (test) on push/PR to main
+- **Package management**: `uv` for Python;
+  `npm` for Node tools (biome, jscpd, markdownlint)
 
 ## Security & Privacy
 
-- **Config immutability**: Two-layer defense prevents weakening linter rules (PreToolUse block + Stop hook recovery)
-- **Subprocess isolation**: `--settings ~/.claude/no-hooks-settings.json` disables hooks in subprocesses; output discarded (`>/dev/null 2>&1`)
-- **Security scanning**: Bandit (Python) and Semgrep (TS/JS) detect common vulnerabilities; excluded from test paths to reduce false positives
-- **Path normalization**: `is_excluded_from_security_linters()` normalizes absolute paths via `CLAUDE_PROJECT_DIR` for consistent exclusion matching
-- **Atomic file operations**: Settings file auto-creation uses `mktemp + mv` pattern for concurrent safety
+- **Config immutability**: Two-layer defense prevents
+  weakening linter rules (PreToolUse + Stop recovery)
+- **Subprocess isolation**: `no-hooks-settings.json`
+  disables hooks; output discarded (`>/dev/null 2>&1`)
+- **Security scanning**: Bandit + Semgrep detect common
+  vulnerabilities; test paths excluded to reduce noise
+- **Path normalization**: Absolute paths normalized via
+  `CLAUDE_PROJECT_DIR` for consistent exclusion matching
+- **Atomic file ops**: Settings auto-creation uses
+  `mktemp + mv` for concurrent safety
 
 ## Performance & Capacity
 
-- **Phase 1 target**: <500ms for auto-formatting (ruff format handles 250k lines in ~100ms)
-- **Subprocess timing**: Haiku ~5s, Sonnet ~15s, Opus ~25s per delegation
-- **Session-scoped tools**: jscpd and Semgrep deferred until 3+ files edited to avoid per-file overhead
-- **Biome caching**: `detect_biome()` caches path in `/tmp/.biome_path_${SESSION_PID}` to avoid repeated discovery
-- **Subprocess timeout**: 300s default (configurable via `HOOK_SUBPROCESS_TIMEOUT`); `timeout` command sends SIGTERM
-- **Main agent blocking**: Hooks are synchronous; entire Phase 1-3 cycle blocks the main agent
+- **Phase 1 target**: <500ms for auto-formatting
+  (ruff format handles 250k lines in ~100ms)
+- **Subprocess timing**: Haiku ~5s, Sonnet ~15s,
+  Opus ~25s per delegation
+- **Session-scoped tools**: jscpd/Semgrep deferred
+  until 3+ files edited to avoid per-file overhead
+- **Biome caching**: Path cached in
+  `/tmp/.biome_path_${SESSION_PID}` per session
+- **Subprocess timeout**: 300s default (configurable
+  via `HOOK_SUBPROCESS_TIMEOUT`); sends SIGTERM
+- **Main agent blocking**: Hooks are synchronous;
+  Phase 1-3 cycle blocks the main agent
 
 ## Resilience
 
-- **Graceful degradation**: Each optional tool checked with `command -v` before invocation; skipped silently if absent
-- **Fail-open**: `jaq` absence causes early exit 0 (not blocking); JSON parse failures default to empty arrays
-- **Subprocess failures**: Non-zero exit logged as `[hook:warning]` but does not block the hook; verification pass follows regardless
-- **Timeout handling**: Exit code 124 from `timeout` command detected and reported; fallback to no-timeout if `timeout` not installed (macOS: `brew install coreutils`)
-- **Version tolerance**: hadolint version < 2.12.0 triggers warning but continues; jscpd handles both `.statistics` (4.0.7+) and `.statistic` (older) response formats
-- **Guard file lifecycle**: PPID-scoped to prevent cross-session interference; hash mismatch triggers re-prompt
+- **Graceful degradation**: Optional tools checked
+  with `command -v`; skipped silently if absent
+- **Fail-open**: `jaq` absence exits 0 (not blocking);
+  JSON parse failures default to empty arrays
+- **Subprocess failures**: Non-zero exit logged as
+  `[hook:warning]`; does not block; verify follows
+- **Timeout handling**: Exit 124 detected and reported;
+  falls back to no-timeout if `timeout` missing
+- **Version tolerance**: hadolint < 2.12.0 warns but
+  continues; jscpd handles both response formats
+- **Guard file lifecycle**: PPID-scoped to prevent
+  cross-session interference; hash mismatch re-prompts
 
 ## Testing & Quality
 
-- **Automated tests**: `test_hook.sh --self-test` covers ~25 cases: file type detection, model selection, config protection, TypeScript handling, fallback behavior
-- **Pre-commit**: 12-phase pipeline mirrors CC hook phases; runs `uv run pre-commit run --all-files`
+- **Automated tests**: `test_hook.sh --self-test`
+  covers ~25 cases: file detection, model selection,
+  config protection, TS handling, fallback behavior
+- **Pre-commit**: 15-hook pipeline mirrors CC hook
+  phases; runs `uv run pre-commit run --all-files`
 - **CI**: GitHub Actions runs pre-commit (lint) + pytest (test) on push/PR to main
-- **Type safety**: Python targets 3.11+; ty type checker runs in Phase 2b; ruff with 50+ rule categories in preview mode
-- **Shell quality**: ShellCheck with maximum enforcement (all optional checks enabled, extended dataflow analysis); shfmt for formatting
-- **Zero-violation baseline**: Template ships with no violations; CLAUDE.md enforces Boy Scout Rule
+- **Type safety**: Python 3.11+; ty in Phase 2b;
+  ruff with 50+ rule categories in preview mode
+- **Shell quality**: ShellCheck max enforcement
+  (all optional checks, extended dataflow); shfmt
+- **Zero-violation baseline**: Ships with no
+  violations; CLAUDE.md enforces Boy Scout Rule
 
 ## Dependencies & Contracts
 
@@ -266,27 +322,66 @@ graph TB
 | `jscpd` | Duplicate detection | Optional; via npx, 5% threshold |
 | `vulture` | Dead code detection | Optional; 80% confidence minimum |
 | `bandit` | Security scanning (Python) | Optional; config in pyproject.toml |
+| `oxlint` | TS/JS type-aware linting | Optional; opt-in via `oxlint_tsgolint` |
+| `knip` | Dead code detection (TS/JS) | Optional; opt-in, project-scoped |
+| `tsgo` | TypeScript type checking | Optional; opt-in, session-scoped |
+| `actionlint` | GitHub Actions linting | Optional; pre-commit only |
+| `check-jsonschema` | GHA workflow schema | Optional; pre-commit only |
+| `flake8-async` | Async pattern linting | Optional; ASYNC rule codes |
 | `uv` | Python package management | Used for `uv run` tool invocation |
 
 ## Risks, Tech Debt, Open Questions
 
-- **Shell script size**: `multi_linter.sh` at ~1,287 lines is large for a single bash script; refactoring into per-language modules would improve maintainability
-- **Fragile parsing**: yamllint, flake8, and markdownlint output parsed via `sed` regex; format changes in these tools could break violation collection
-- **Blocking model**: Synchronous hook execution means Phase 3 subprocess (up to 300s) blocks the main agent entirely
-- **Session state in /tmp**: PPID-scoped files (`jscpd_session`, `semgrep_session`, `biome_path`) rely on process hierarchy; unusual session restarts could cause stale markers
-- **TypeScript disabled by default**: `config.json` has `typescript.enabled: false`; users must opt-in and install Biome separately
+- **Shell script size**: `multi_linter.sh` ~1,286
+  lines; per-language modules would help
+- **Fragile parsing**: yamllint/flake8/markdownlint
+  output parsed via `sed`; format changes break it
+- **Blocking model**: Synchronous hooks mean Phase 3
+  subprocess (up to 300s) blocks main agent
+- **Session state in /tmp**: PPID-scoped files rely
+  on process hierarchy; restarts cause stale markers
+- **TS disabled by default**: `typescript.enabled:
+  false`; users must opt-in and install Biome
 - **No Windows support**: Bash-based hooks require Unix-like environment
-- **macOS `timeout`**: Requires `brew install coreutils`; falls back to no timeout if absent
+- **macOS `timeout`**: Requires `brew install
+  coreutils`; falls back to no timeout if absent
+
+## Supporting Files
+
+- **`scripts/init-typescript.sh`**: Initializes
+  TypeScript support (installs Biome, creates configs)
+- **`tests/stress/run_stress_tests.sh`**: Stress test
+  suite for hook performance under load
+- **`docs/adr-*.md`**: Architecture Decision Records
+  (hook schema, package manager, TS expansion)
+- **`docs/adr-implementation-plans/`**: Implementation
+  plans for major features (TS hooks expansion)
+- **`docs/stress-test-report.md`**: Results from hook
+  stress testing
+- **`docs/portable-hooks-template.md`**: Template
+  adoption guide
+- **`.claude/spec/`**: Spec review skill definitions
+  (out of scope for hook architecture)
 
 ## Glossary
 
-- **Boy Scout Rule**: Policy that editing a file makes you responsible for all its violations, not just ones you introduced
-- **Phase 1/2/3**: Auto-format (silent), collect violations (JSON), delegate to subprocess + verify
-- **PostToolUse**: Claude Code hook lifecycle event fired after Edit/Write tool completes
-- **PreToolUse**: Claude Code hook lifecycle event fired before Edit/Write tool executes; can block
-- **Stop hook**: Claude Code hook lifecycle event fired when session ends; can block exit
-- **Guard file**: PPID-scoped JSON in `/tmp` storing SHA-256 hashes of approved config file modifications
-- **Session-scoped**: Tools (jscpd, Semgrep) that run once per session after a file count threshold
-- **SFC**: Single-File Components (`.vue`, `.svelte`, `.astro`) - receive Semgrep-only coverage
-- **Subprocess delegation**: Spawning `claude -p` to autonomously fix collected violations
-- **Volume threshold**: Number of violations (default 5) above which opus model is selected
+- **Boy Scout Rule**: Editing a file makes you
+  responsible for all its violations
+- **Phase 1/2/3**: Auto-format, collect violations,
+  delegate to subprocess + verify
+- **PostToolUse**: CC hook event fired after
+  Edit/Write completes
+- **PreToolUse**: CC hook event fired before
+  Edit/Write executes; can block
+- **Stop hook**: CC hook event fired when session
+  ends; can block exit
+- **Guard file**: PPID-scoped JSON in `/tmp` storing
+  SHA-256 hashes of approved config modifications
+- **Session-scoped**: Tools (jscpd, Semgrep) that
+  run once per session after a file count threshold
+- **SFC**: Single-File Components (`.vue`, `.svelte`,
+  `.astro`) — Semgrep-only coverage
+- **Subprocess delegation**: Spawning `claude -p`
+  to autonomously fix collected violations
+- **Volume threshold**: Violation count (default 5)
+  above which opus model is selected

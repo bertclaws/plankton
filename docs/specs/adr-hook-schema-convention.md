@@ -191,7 +191,17 @@ exit 0) for all current and new hooks. Do not adopt the official
 
 | Risk | Lklhd | Imp | Mitigation |
 | --- | --- | --- | --- |
-| CC tightens validation | Low | Hi | Hooks break; migration needed |
+| CC tightens validation | Med | Hi | `decision` deprecated; migration noted |
+
+**2026-02 Update**: The official Claude Code documentation now explicitly
+states that `decision` and `reason` fields are **deprecated for PreToolUse**
+hooks. The recommended schema is `hookSpecificOutput.permissionDecision`
+with values `allow|deny|ask`. The deprecated `approve|block` values are
+still mapped by the runtime (hooks continue to work), but this confirms the
+risk is materializing. The project should plan the atomic migration
+documented in "Risk Detail: Validation Tightening" below. For PostToolUse,
+Stop, and other events, the top-level `decision` field remains current and
+is not deprecated.
 | New hook needs `ask` | Low | Med | Evaluate then; may migrate |
 | Non-standard schema confusion | Low | Low | This ADR documents it |
 | `updatedInput` needed | Low | Med | Requires official schema |
@@ -300,7 +310,7 @@ with these parameters") and `systemMessage` for brief user-facing context.
 ## Related Documents
 
 - [ADR: Package Manager Enforcement](adr-package-manager-enforcement.md) —
-  Amendment F references this schema convention
+  Script Conventions section references this schema convention
 - [README.md Hook Schema Reference](../.claude/hooks/README.md) — Line 817,
   documents the convention in table form
 - [Architecture Overview](psf/00-cc-hooks-template-architecture-overview.md) —

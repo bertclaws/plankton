@@ -1,8 +1,13 @@
 # ADR: Package Manager Enforcement via PreToolUse Hook
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-02-16
 **Author**: alex fazio + Claude Code clarification interview
+
+**Note**: This ADR includes implementation-level detail (regex patterns,
+bash code, processing flow) because these ARE the core architectural
+decisions. The choices of regex dialect, elif vs. if control flow, and
+word boundary strategy directly embody decisions D3, D4, and D7.
 
 ## Context and Problem Statement
 
@@ -58,21 +63,63 @@ is the correct strategy, matching the existing defense pattern: PreToolUse
 for prevention (`protect_linter_configs.sh`), Stop for recovery
 (`stop_config_guardian.sh`).
 
-### D2: Block Mode - Block + Suggest (Not Auto-Rewrite)
+### D2: Enforcement Mode - Block by Default, Warn via Config
 
 **Decision**: Block the command and suggest the correct replacement in the
-error message. Do not attempt to auto-rewrite the command.
+error message. Do not attempt to auto-rewrite the command. Configurable
+warn mode is available via the `:warn` config suffix for migration
+scenarios.
 
-**Rationale**:
+**Three-position enforcement model**:
+
+| Config Value | Behavior | Use Case |
+| --- | --- | --- |
+| `"uv"` | Block (command prevented, replacement suggested) | Steady state |
+| `"uv:warn"` | Warn (command proceeds, advisory on stderr) | Migration |
+| `false` | Off (no enforcement) | Ecosystem not applicable |
+
+Block is the **default and recommended** mode. The `:warn` suffix is
+opt-in for teams transitioning to uv/bun who want visibility before
+commitment.
+
+**Rationale for block as default**:
 
 1. Command flag mapping between package managers is non-trivial
-   (`npm install --save-dev` flags do not 1:1 map to `bun add --dev`
-   in all cases)
+   (`npm install` flags do not all 1:1 map to `bun add` equivalents
+   — e.g., `--save-optional`, `--save-peer` behave differently)
 2. Silent rewriting could produce subtly wrong commands
 3. The agent has full context to reformulate correctly after receiving
    the block message
 4. Matches the existing config protection hook philosophy: "Fix the code,
    not the rules" becomes "Use the right tool, don't rewrite the wrong one"
+
+**Agent-vs-human caveat for warn mode**: Warn mode works differently for
+AI agents than for human developers. A human sees a warning and exercises
+judgment before the next command. An AI agent (Claude) receives the
+warning in context, but the current command **already executed** — the
+lockfile damage already happened. The warning only helps if Claude
+modifies behavior in subsequent commands. For this reason, warn mode for
+package managers should be treated as a **time-bounded migration tool**,
+not permanent enforcement. Industry precedent (ESLint, typescript-eslint)
+confirms that warnings as permanent enforcement are an anti-pattern due
+to habituation — teams (and agents) stop responding to warnings that
+never block progress.
+
+**Warn mode time-boxing recommendation**: Since warn mode allows
+commands to execute (causing lockfile damage before the advisory is
+processed), and since industry precedent (ESLint, typescript-eslint)
+confirms that warnings as permanent enforcement are an anti-pattern due
+to habituation, teams should treat warn mode as a bounded migration
+tool. When enabling `:warn`, set a specific deadline (e.g., 2 sprints
+or 30 days) and create a tracking item (Linear issue, calendar event)
+to escalate to block mode. Do not leave warn mode enabled indefinitely.
+
+**Warn mode behavioral contract**: When enforcement mode is `warn`, the
+hook outputs `{"decision": "approve"}` (allowing the command) and writes
+an advisory to stderr using the same `[hook:advisory]` prefix as the
+CLI tool preferences hook. The replacement command suggestion is included
+in the advisory message. This matches the warn infrastructure in
+[ADR: CLI Tool Preference Warnings](adr-cli-tool-preference-warnings.md).
 
 ### D3: Python Enforcement Scope
 
@@ -170,7 +217,20 @@ but the allowlist is kept as-is because:
 (1) bun equivalents are recent and may have edge cases, (2) allowing
 registry operations doesn't violate the core enforcement goal, (3)
 shrinking is easy when bun matures, expanding after a bug is disruptive.
-Review allowlist when bun reaches 2.x stable.
+As of this writing, bun is at v1.3.9 (not yet 2.x). Several open issues
+affect the bun equivalents of allowlisted npm commands: no `audit fix`
+equivalent ([#20238](https://github.com/oven-sh/bun/issues/20238)),
+`bun publish` fails in CI authentication
+([#24124](https://github.com/oven-sh/bun/issues/24124)) and with custom
+registries ([#18670](https://github.com/oven-sh/bun/issues/18670)), and
+there is no `bun login` equivalent. Two issues have been resolved since
+the initial draft: `bun audit` hanging indefinitely
+([#20800](https://github.com/oven-sh/bun/issues/20800), closed
+2025-09-09) and `bun pm pack` ignoring prepack scripts
+([#24314](https://github.com/oven-sh/bun/issues/24314), closed
+2026-01-23). Review the allowlist at Q4 2026 or when bun reaches 2.x
+stable (whichever comes first), focusing on audit fix, publish CI auth,
+and custom registry support.
 
 **yarn/pnpm registry allowlist** (configurable in `allowed_subcommands.yarn`
 and `allowed_subcommands.pnpm`, see D9): `yarn audit`, `yarn info`,
@@ -231,8 +291,8 @@ positives in these edge cases:
 - Comments: `# pip install foo` — blocked even though it's a comment
 - Quoted strings: `echo "pip install foo"` — blocked even though it's
   a string literal
-- Variable assignments: `PKG_MGR=pip` — not blocked (no word boundary
-  match on `pip` as a standalone command)
+- Variable assignments: `PKG_MGR=pip` — blocked (false positive: the
+  bare pip regex matches `pip` after `=` since `=` is not in `[a-zA-Z0-9_]`)
 - Diagnostic flags in Python compound commands:
   `pip --version && poetry add requests` — `pip --version` matches the
   diagnostic carve-out, the elif chain exits, and `poetry add` is not
@@ -242,6 +302,22 @@ positives in these edge cases:
 These are accepted trade-offs. In practice, Claude rarely generates
 commands with package manager names in comments or here-docs. The
 pragmatic substring approach catches 99%+ of real cases.
+
+- **Warn mode compound behavior**: In warn mode, `warn()` calls `exit 0`
+  — same as `block()`. For compound commands like `pip install && npm install`,
+  only the first match emits a warning; subsequent violations in the same
+  command execute silently. In block mode, the entire command is prevented
+  and Claude retries (hitting the next violation). In warn mode, all parts
+  of the compound command execute but only one advisory is emitted. This is
+  accepted because: (1) warn mode is advisory-only, (2) the first warning
+  signals the project's toolchain preference, (3) cross-ecosystem compound
+  commands are rare in practice.
+
+- **Shell variable expansion evasion**: `cmd=pip; $cmd install requests`
+  evades detection because `$cmd` is not expanded at the regex level.
+  Accepted: the hook prevents unintentional use of wrong package managers,
+  not adversarial evasion. Claude does not generate variable-indirection
+  patterns for package management.
 
 **Compound command behavior**: When a command contains multiple package
 manager violations (e.g., `pip install && npm install`), the hook blocks on
@@ -280,6 +356,20 @@ example:
 - `npm install lodash` -> `Use: bun add lodash`
 - `npx create-react-app` -> `Use: bunx create-react-app`
 
+**Warn message format**: When enforcement mode is `warn`, the advisory
+uses different framing — "detected/prefer" instead of "not allowed/use":
+
+```text
+[hook:advisory] pip detected. Prefer: uv add requests flask
+[hook:advisory] npm detected. Prefer: bun add lodash
+[hook:advisory] npx detected. Prefer: bunx create-react-app
+```
+
+The `[hook:advisory]` prefix matches the CLI tool preferences hook
+(see [ADR: CLI Tool Preference Warnings](adr-cli-tool-preference-warnings.md)).
+The mode-aware framing ensures warn messages are factually accurate — pip
+IS allowed in warn mode, so "not allowed" would be incorrect.
+
 ### D9: Configuration Design
 
 **Decision**: Top-level `package_managers` key in `config.json` with
@@ -304,12 +394,39 @@ lightweight toggles (not a full command mapping).
 }
 ```
 
+**Note on value types**: The `package_managers` section uses string
+values (`"uv"`, `"bun"`) while the `languages` section uses booleans
+(`true`/`false`). In `package_managers`, `"python": false` disables
+enforcement; in `languages`, `"python": false` disables linting. The
+string value serves dual purpose: enables enforcement AND names the
+replacement tool used in block messages.
+
 **Toggle behavior**:
 
 - `"python": "uv"` — enforce uv, block pip/poetry/pipenv
+- `"python": "uv:warn"` — enforce uv, warn on pip/poetry/pipenv (advisory only)
 - `"python": false` — disable Python package manager enforcement
 - `"javascript": "bun"` — enforce bun, block npm/yarn/pnpm
+- `"javascript": "bun:warn"` — enforce bun, warn on npm/yarn/pnpm (advisory only)
 - `"javascript": false` — disable JS package manager enforcement
+
+**Enforcement mode parsing**: The `:warn` suffix is stripped to extract
+the replacement tool name. `"uv:warn"` → tool=`uv`, mode=`warn`.
+`"uv"` → tool=`uv`, mode=`block` (default). `false` → mode=`off`.
+
+```bash
+parse_pm_config() {
+  local value="$1"
+  case "${value}" in
+    false) echo "off" ;;
+    *:warn) echo "warn:${value%:warn}" ;;
+    *) echo "block:${value}" ;;
+  esac
+}
+# "uv"      → "block:uv"
+# "uv:warn" → "warn:uv"
+# false      → "off"
+```
 
 **Allowlist behavior**: The `allowed_subcommands` object provides a
 unified configurable allowlist for every blocked tool. Each key maps a
@@ -332,6 +449,98 @@ is_allowed_subcommand() {
   return 1
 }
 ```
+
+```bash
+approve() {
+  echo '{"decision": "approve"}'
+  exit 0
+}
+
+block() {
+  local tool="$1" subcmd="${2:-}"
+  local replacement
+  replacement=$(compute_replacement_message "${tool}" "${subcmd}")
+  echo "{\"decision\": \"block\", \"reason\": \"[hook:block] ${tool} is not allowed. Use: ${replacement}\"}"
+  exit 0
+}
+```
+
+```bash
+warn() {
+  local tool="$1" subcmd="${2:-}"
+  local replacement
+  replacement=$(compute_replacement_message "${tool}" "${subcmd}")
+  echo '{"decision": "approve"}'
+  echo "[hook:advisory] ${tool} detected. Prefer: ${replacement}" >&2
+  exit 0
+}
+```
+
+```bash
+enforce() {
+  local mode="$1" tool="$2" subcmd="${3:-}"
+  if [[ "${mode}" == "warn" ]]; then
+    warn "${tool}" "${subcmd}"
+  else
+    block "${tool}" "${subcmd}"
+  fi
+}
+```
+
+```bash
+# Pseudocode — maps tool+subcmd to replacement command string
+# See "Replacement Command Computation" table for full mapping
+compute_replacement_message() {
+  local tool="$1" subcmd="${2:-}"
+  case "${tool}:${subcmd}" in
+    pip:install|pip3:install)
+      # If command contains -r → "uv pip install -r <file>"
+      # If command contains -e → "uv pip install -e ."
+      # Otherwise → "uv add <packages>" ;;
+    pip:uninstall)   echo "uv remove <packages>" ;;
+    pip:freeze)      echo "uv pip freeze" ;;
+    pip:list)        echo "uv pip list" ;;
+    pip:*)           echo "uv <equivalent>" ;;
+    "python -m pip":*) echo "uv add <packages>" ;;
+    "python -m venv":*) echo "uv venv" ;;
+    npm:install|npm:i|npm:ci) echo "bun add <pkg> or bun install" ;;
+    npm:run)         echo "bun run <script>" ;;
+    npm:test)        echo "bun test" ;;
+    npm:start)       echo "bun run start" ;;
+    npm:exec)        echo "bunx <pkg>" ;;
+    npm:init)        echo "bun init" ;;
+    npm:*)           echo "bun <equivalent>" ;;
+    npx:*)           echo "bunx <pkg>" ;;
+    poetry:add)      echo "uv add <packages>" ;;
+    poetry:install)  echo "uv sync" ;;
+    poetry:run)      echo "uv run <cmd>" ;;
+    poetry:lock)     echo "uv lock" ;;
+    poetry:*)        echo "uv <equivalent>" ;;
+    pipenv:install)  echo "uv add <pkg> or uv sync" ;;
+    pipenv:run)      echo "uv run <cmd>" ;;
+    pipenv:*)        echo "uv <equivalent>" ;;
+    yarn:add)        echo "bun add <packages>" ;;
+    yarn:install)    echo "bun install" ;;
+    yarn:run)        echo "bun run <script>" ;;
+    yarn:*)          echo "bun <equivalent>" ;;
+    pnpm:add)        echo "bun add <packages>" ;;
+    pnpm:install)    echo "bun install" ;;
+    pnpm:run)        echo "bun run <script>" ;;
+    pnpm:*)          echo "bun <equivalent>" ;;
+  esac
+}
+```
+
+**Helper functions**: `approve()` outputs approve JSON and exits. `block()`
+and `warn()` both call `compute_replacement_message()` to get the
+replacement command, then frame it differently — block says "X is not
+allowed. Use: Y", warn says "X detected. Prefer: Y". This mode-aware
+framing is consistent with the CLI tool preferences ADR tone (see
+[ADR: CLI Tool Preference Warnings](adr-cli-tool-preference-warnings.md)).
+`enforce()` dispatches to `block()` or `warn()` based on the parsed mode
+from `parse_pm_config()` (see D9). `compute_replacement_message()` maps
+tool+subcmd pairs to replacement command strings per the Replacement
+Command Computation table.
 
 **Rationale**: The actual blocked patterns and suggestion messages stay
 hardcoded in the script (domain knowledge). Config controls enforcement
@@ -374,6 +583,28 @@ fallback), consistent with the script's fail-safe philosophy. "Enabled by
 default" refers to the template's shipped configuration, not to hardcoded
 script behavior.
 
+### Prerequisites for Adoption
+
+Before enabling enforcement, the following should be true:
+
+- **Python**: `uv` installed and available in PATH (`brew install uv` or
+  `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **JavaScript**: `bun` installed and available in PATH
+  (`curl -fsSL https://bun.sh/install | bash`)
+- **Python projects**: Should have been initialized with `uv init` or
+  have a `pyproject.toml`. Existing `requirements.txt`-only projects
+  should migrate lockfiles before enabling enforcement
+- **JS projects**: Should have `bun.lock` (or legacy `bun.lockb`) or be
+  ready to generate one via `bun install`
+- **jaq**: `jaq` (a jq clone written in Rust) installed and available in
+  PATH (`brew install jaq` or `cargo install jaq`). Required for JSON parsing
+  of stdin input and config.json. If jaq is missing, the hook fails open
+  (approves all commands)
+- **Fallback**: If prerequisites are not met, the replacement tool
+  existence check (see "Replacement Tool Existence Check" section)
+  warns on first blocked command that the replacement is unavailable.
+  Enforcement still blocks — it does not fall back to allowing pip/npm
+
 ### D11: Architecture - Separate Script File
 
 **Decision**: Create a new file `.claude/hooks/enforce_package_managers.sh`,
@@ -398,13 +629,18 @@ the matchers are different. `protect_linter_configs.sh` matches
 **Decision**: Full self-test coverage added to `test_hook.sh` covering
 all enforcement scenarios.
 
-**Test cases required**:
+**Test cases required** (implemented via a new `test_bash_command()` helper
+in `test_hook.sh` that handles: JSON with `tool_input.command`, stdout
+capture for decision JSON, stderr capture for advisories, temp `config.json`
+via `CLAUDE_PROJECT_DIR` override, and PATH mocking for replacement tool
+existence checks):
 
 | Test | Input | Expected |
 | --- | --- | --- |
 | pip install blocked | `pip install requests` | block + suggest `uv add` |
 | pip3 blocked | `pip3 install flask` | block |
 | python -m pip blocked | `python -m pip install pkg` | block |
+| python3 -m pip blocked | `python3 -m pip install pkg` | block |
 | python -m venv blocked | `python -m venv .venv` | block + suggest `uv venv` |
 | poetry blocked | `poetry add requests` | block |
 | pipenv blocked | `pipenv install` | block |
@@ -457,6 +693,30 @@ all enforcement scenarios.
 | bun missing warning | `npm install` (bun not in PATH) | block + warning |
 | debug mode output | `pip install` (HOOK_DEBUG_PM=1) | block + stderr debug |
 | HOOK_SKIP_PM bypass | `pip install` (HOOK_SKIP_PM=1) | approve |
+| pip warn mode | `pip install` (python: "uv:warn") | approve + advisory |
+| npm warn mode | `npm install` (js: "bun:warn") | approve + advisory |
+| warn + allowlist | `npm audit` (js: "bun:warn") | approve (no warn) |
+| warn + diagnostic | `pip --version` (py: "uv:warn") | approve (no warn) |
+| compound warn | `cd /app && pip install` (py: "uv:warn") | approve + advise |
+| warn msg format | `pip install flask` (py: "uv:warn") | has `uv add flask` |
+
+**Integration testing checklist**: The unit tests above validate the
+script's stdin-to-stdout logic in isolation. The following manual
+integration steps should be performed after implementation to verify
+end-to-end behavior in a live Claude Code session:
+
+1. **Matcher triggers**: Run `pip install requests` in a Claude session
+   and verify the PreToolUse:Bash hook fires (visible in `--debug hooks`)
+2. **Block message received**: Verify Claude sees the block reason and
+   does not attempt to execute the original command
+3. **Replacement reformulation**: Verify Claude reformulates the command
+   using the suggested replacement (e.g., `uv add requests`)
+4. **Compound command retry**: Run `pip install && npm install` and
+   verify Claude retries after the first block, then hits the second
+5. **Warn mode advisory**: Set `"python": "uv:warn"` and verify Claude
+   receives the `[hook:advisory]` message in context
+6. **Fail-open**: Temporarily rename `config.json` and verify `pip
+   install` is approved (not blocked)
 
 ## Settings Registration
 
@@ -513,7 +773,13 @@ The script must follow these conventions from the existing codebase:
   `permissionDecision: "allow|deny|ask"` schema. This is intentional:
   (1) cross-hook consistency within the project, (2) no `ask` use case
   for binary enforcement decisions, (3) schema migration across all hooks
-  is a separate concern if needed later
+  is a separate concern if needed later. See
+  [ADR: Hook JSON Schema Convention](adr-hook-schema-convention.md) for
+  the full divergence analysis and migration path. **Note**: The schema
+  convention ADR's 2026-02 update confirms that the `decision` field is
+  now deprecated for PreToolUse hooks. This hook will require migration
+  to `hookSpecificOutput.permissionDecision` when the atomic migration
+  documented in the schema convention ADR is executed
 - **Fail-open**: If `jaq` is missing, input JSON is malformed, or any
   parsing error occurs, output `{"decision": "approve"}` and exit 0.
   A broken hook must not block all Bash commands. This matches the
@@ -527,6 +793,14 @@ The script must follow these conventions from the existing codebase:
 - **Auto-protection**: The new script at `.claude/hooks/enforce_package_managers.sh`
   is automatically protected from modification by the existing
   `protect_linter_configs.sh` which blocks edits to all `.claude/hooks/*` files
+
+### Performance Characteristics
+
+Expected execution time is <50ms (two `jaq` invocations for JSON parsing
+and config loading, plus bash regex matching). The 5-second timeout in
+`settings.json` provides ~100x headroom and matches the existing
+`protect_linter_configs.sh` timeout. No network I/O or disk I/O beyond
+the single `config.json` read.
 
 ### Input/Output Contract
 
@@ -561,6 +835,7 @@ or:
 3. Load ${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/config.json
    -> package_managers section (fail-open: use defaults if missing)
 4. If python enforcement enabled (value != "false"):
+   a0. Parse mode: "uv" → block, "uv:warn" → warn (see parse_pm_config)
    a. Check for uv prefix (passthrough if found — elif chain required)
    b. Match pip/pip3: extract subcommand, check allowed_subcommands.pip
    b2. Diagnostic flags (--version, -v, -V, --help, -h): no-op
@@ -570,26 +845,28 @@ or:
    d2. Poetry diagnostic flags: no-op
    e. Match pipenv: extract subcommand, check allowed_subcommands.pipenv
    e2. Pipenv diagnostic flags: no-op
-   f. If matched and not allowlisted: block with message
+   f. If matched and not allowlisted: call block() or warn() per mode
    Note: Python uses elif chain (not separate if blocks) because
    "uv pip" contains substring "pip" — separate blocks would
    false-positive on uv commands. Diagnostic no-ops inside the
    elif chain mean `pip --version && poetry add` misses poetry
    (accepted limitation — see D7).
 5. If javascript enforcement enabled (value != "false"):
+   a0. Parse mode: "bun" → block, "bun:warn" → warn (see parse_pm_config)
    Each JS tool checked independently (separate if blocks, NOT elif):
    a. npm: extract subcommand, check allowed_subcommands.npm;
       then try flag+subcommand extraction (npm -g install → extract
       subcommand after flags, check allowlist); then diagnostic
       flags (no-op); then bare flag catch; then bare npm
-   b. npx: diagnostic flags (no-op); then block (suggest bunx)
+   b. npx: diagnostic flags (no-op); then enforce (suggest bunx)
    c. yarn: extract subcommand, check allowed_subcommands.yarn;
-      diagnostic flags (no-op); bare yarn = yarn install (block)
+      diagnostic flags (no-op); bare yarn = yarn install (enforce)
    d. pnpm: extract subcommand, check allowed_subcommands.pnpm;
-      diagnostic flags (no-op); bare pnpm = pnpm install (block)
+      diagnostic flags (no-op); bare pnpm = pnpm install (enforce)
    Independent checks prevent allowlist bypass in compound commands
    (e.g., npm audit && yarn add bypassed the old elif chain).
    Diagnostic no-ops in JS if blocks safely continue to next tool.
+   "Enforce" calls block() or warn() per the parsed mode.
 6. If no match: approve
 7. Always exit 0 (JSON stdout carries the decision)
 ```
@@ -614,6 +891,8 @@ substring `pip`; separate if blocks would false-positive on uv commands):
 WB_START='(^|[^a-zA-Z0-9_])'
 WB_END='([^a-zA-Z0-9_]|$)'
 
+# py_mode set from parse_pm_config (e.g., "block" or "warn")
+
 # Step 1: Check for uv pip prefix -> passthrough (approve)
 if [[ "${command}" =~ ${WB_START}uv[[:space:]]+pip ]]; then
   approve  # uv pip install, uv pip freeze, etc.
@@ -621,37 +900,37 @@ if [[ "${command}" =~ ${WB_START}uv[[:space:]]+pip ]]; then
 # Step 2: pip/pip3 -> extract subcommand, check allowlist
 elif [[ "${command}" =~ ${WB_START}pip3?[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "pip" "${subcmd}" || block "pip" "${subcmd}"
+  is_allowed_subcommand "pip" "${subcmd}" || enforce "${py_mode}" "pip" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}pip3?[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # pip diagnostic — no-op (elif chain exits without blocking)
 elif [[ "${command}" =~ ${WB_START}pip3?${WB_END} ]]; then
-  block "pip"  # bare pip
+  enforce "${py_mode}" "pip"  # bare pip
 
-# Step 3: python -m pip -> block
+# Step 3: python -m pip -> enforce
 elif [[ "${command}" =~ ${WB_START}python3?[[:space:]]+-m[[:space:]]+pip${WB_END} ]]; then
-  block "python -m pip"
+  enforce "${py_mode}" "python -m pip"
 
-# Step 4: python -m venv -> block
+# Step 4: python -m venv -> enforce
 elif [[ "${command}" =~ ${WB_START}python3?[[:space:]]+-m[[:space:]]+venv${WB_END} ]]; then
-  block "python -m venv"
+  enforce "${py_mode}" "python -m venv"
 
-# Step 5: poetry -> blanket block with allowlist
+# Step 5: poetry -> blanket enforce with allowlist
 elif [[ "${command}" =~ ${WB_START}poetry[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "poetry" "${subcmd}" || block "poetry" "${subcmd}"
+  is_allowed_subcommand "poetry" "${subcmd}" || enforce "${py_mode}" "poetry" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}poetry[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # poetry diagnostic — no-op
 elif [[ "${command}" =~ ${WB_START}poetry${WB_END} ]]; then
-  block "poetry"  # bare poetry
+  enforce "${py_mode}" "poetry"  # bare poetry
 
-# Step 6: pipenv -> blanket block with allowlist
+# Step 6: pipenv -> blanket enforce with allowlist
 elif [[ "${command}" =~ ${WB_START}pipenv[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "pipenv" "${subcmd}" || block "pipenv" "${subcmd}"
+  is_allowed_subcommand "pipenv" "${subcmd}" || enforce "${py_mode}" "pipenv" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}pipenv[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # pipenv diagnostic — no-op
 elif [[ "${command}" =~ ${WB_START}pipenv${WB_END} ]]; then
-  block "pipenv"  # bare pipenv
+  enforce "${py_mode}" "pipenv"  # bare pipenv
 fi
 ```
 
@@ -659,13 +938,8 @@ fi
 (not separate if blocks) because `uv pip` contains the substring `pip`.
 With separate if blocks, the bare `pip` check would false-positive on
 `uv pip install`. The elif ordering (check `uv pip` first, then bare
-`pip`) is essential. Two compound command edge cases are accepted as
-known limitations (both are unrealistic in practice):
-
-- `uv pip install && pip install` — `uv pip` match approves, bare
-  `pip install` unchecked
-- `pip --version && poetry add` — pip diagnostic no-op exits the elif
-  chain, `poetry add` unchecked
+`pip`) is essential. See D7 for compound command edge cases and known
+limitations of the elif chain.
 
 **JavaScript enforcement** — independent if blocks per tool (NOT elif):
 
@@ -676,51 +950,52 @@ checked. With independent if blocks, an allowlist hit continues to the
 next tool check; only a block hit exits immediately.
 
 ```bash
-# Each JS PM checked independently — block exits, allowlist continues
+# Each JS PM checked independently — enforce exits, allowlist continues
+# js_mode set from parse_pm_config (e.g., "block" or "warn")
 
 # npm (independent check)
 if [[ "${command}" =~ ${WB_START}npm[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "npm" "${subcmd}" || block "npm" "${subcmd}"
+  is_allowed_subcommand "npm" "${subcmd}" || enforce "${js_mode}" "npm" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}npm[[:space:]]+-[^[:space:]]*[[:space:]]+([a-zA-Z]+) ]]; then
   # flags before subcommand — extract subcommand after flags, check allowlist
-  # npm -g install → captures "install" → not allowlisted → block
+  # npm -g install → captures "install" → not allowlisted → enforce
   # npm --registry=url audit → captures "audit" → allowlisted → approve
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "npm" "${subcmd}" || block "npm" "${subcmd}"
+  is_allowed_subcommand "npm" "${subcmd}" || enforce "${js_mode}" "npm" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}npm[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # npm diagnostic — continue to next tool check
 elif [[ "${command}" =~ ${WB_START}npm[[:space:]]+- ]]; then
-  block "npm"  # unrecognized flags with no subcommand after
+  enforce "${js_mode}" "npm"  # unrecognized flags with no subcommand after
 elif [[ "${command}" =~ ${WB_START}npm${WB_END} ]]; then
-  block "npm"  # bare npm
+  enforce "${js_mode}" "npm"  # bare npm
 fi
 
 # npx (independent check)
 if [[ "${command}" =~ ${WB_START}npx[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # npx diagnostic — continue to next tool check
 elif [[ "${command}" =~ ${WB_START}npx${WB_END} ]]; then
-  block "npx"  # suggest bunx
+  enforce "${js_mode}" "npx"  # suggest bunx
 fi
 
 # yarn (independent check — not elif from npm)
 if [[ "${command}" =~ ${WB_START}yarn[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "yarn" "${subcmd}" || block "yarn" "${subcmd}"
+  is_allowed_subcommand "yarn" "${subcmd}" || enforce "${js_mode}" "yarn" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}yarn[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # yarn diagnostic — continue to next tool check
 elif [[ "${command}" =~ ${WB_START}yarn${WB_END} ]]; then
-  block "yarn" "install"  # bare yarn = yarn install
+  enforce "${js_mode}" "yarn" "install"  # bare yarn = yarn install
 fi
 
 # pnpm (independent check — not elif from yarn)
 if [[ "${command}" =~ ${WB_START}pnpm[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "pnpm" "${subcmd}" || block "pnpm" "${subcmd}"
+  is_allowed_subcommand "pnpm" "${subcmd}" || enforce "${js_mode}" "pnpm" "${subcmd}"
 elif [[ "${command}" =~ ${WB_START}pnpm[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # pnpm diagnostic — continue to next tool check
 elif [[ "${command}" =~ ${WB_START}pnpm${WB_END} ]]; then
-  block "pnpm" "install"  # bare pnpm = pnpm install
+  enforce "${js_mode}" "pnpm" "install"  # bare pnpm = pnpm install
 fi
 ```
 
@@ -741,7 +1016,15 @@ legitimate allowlisted commands with flag prefixes
 (`npm -g install` → block). The pattern `-[^[:space:]]*[[:space:]]+`
 matches one flag token (dash + non-spaces + space) before the subcommand.
 Diagnostic flags (`--version`, `--help`) are handled by a separate
-no-op branch that fires before the blanket flag catch.
+no-op branch that fires before the blanket flag catch. **Multi-flag
+limitation**: npm commands with multiple flags before the subcommand
+(e.g., `npm -g --registry=url install foo`) are not fully parsed — the
+regex extracts only one flag token, and the second flag (`--registry`)
+fails the `([a-zA-Z]+)` subcommand capture. The command falls through
+to the bare flag catch and is correctly blocked, but with a generic
+replacement suggestion rather than a specific one. This is accepted
+because multi-flag npm commands are rare in Claude-generated code and
+the block behavior is correct.
 
 ### Replacement Command Computation
 
@@ -762,6 +1045,23 @@ constructs the replacement:
 | `npm run <script>` | `<script>` | `bun run <script>` |
 | `npm test` | - | `bun test` |
 | `npx <pkg>` | `<pkg>` | `bunx <pkg>` |
+| `poetry add <pkgs>` | `<pkgs>` | `uv add <pkgs>` |
+| `poetry install` | - | `uv sync` |
+| `poetry run <cmd>` | `<cmd>` | `uv run <cmd>` |
+| `poetry lock` | - | `uv lock` |
+| `poetry <other>` | - | `uv` equivalents (generic) |
+| `pipenv install <pkg>` | `<pkg>` | `uv add <pkg>` |
+| `pipenv install` | - | `uv sync` |
+| `pipenv run <cmd>` | `<cmd>` | `uv run <cmd>` |
+| `pipenv <other>` | - | `uv` equivalents (generic) |
+| `yarn add <pkg>` | `<pkg>` | `bun add <pkg>` |
+| `yarn install` / bare `yarn` | - | `bun install` |
+| `yarn run <script>` | `<script>` | `bun run <script>` |
+| `yarn <other>` | - | `bun` equivalents (generic) |
+| `pnpm add <pkg>` | `<pkg>` | `bun add <pkg>` |
+| `pnpm install` / bare `pnpm` | - | `bun install` |
+| `pnpm run <script>` | `<script>` | `bun run <script>` |
+| `pnpm <other>` | - | `bun` equivalents (generic) |
 
 For compound commands where extraction is ambiguous, the message suggests
 the general replacement tool without attempting to rewrite the full
@@ -785,12 +1085,39 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 ```
 
+**Note on `HOOK_GUARD_PID`**: This variable is used by the existing hook
+infrastructure (specifically `stop_config_guardian.sh`) to scope session
+marker files to the Claude Code session's process ID. The fallback `${PPID}`
+ensures markers work
+even if `HOOK_GUARD_PID` is not set. Marker files in `/tmp/` are transient —
+they persist until system reboot or `/tmp` cleanup, which is the intended
+behavior (session-scoped, not permanent).
+
 **Rationale**: Without this check, Claude receives a block message saying
 "use uv instead" but has no way to know uv is not installed. The result is a
 frustrating loop: Claude tries `uv`, gets "command not found", and has no
 remediation path. The warning provides actionable feedback. The command is
 still blocked regardless — policy enforcement is unconditional. This follows
 the established pattern from `multi_linter.sh` (hadolint version warning).
+
+### Observability
+
+The debug variable `HOOK_DEBUG_PM=1` provides interactive troubleshooting
+output. For passive data collection to assess enforcement effectiveness
+over time, the hook supports an optional decision log:
+
+- **Variable**: `HOOK_LOG_PM=1` enables logging to
+  `/tmp/.pm_enforcement_${HOOK_GUARD_PID:-${PPID}}.log` (session-scoped)
+- **Format**: `timestamp | action(approve/block/warn) | tool | subcmd |
+  command_excerpt` (one line per decision)
+- **Disabled by default**: No overhead when not enabled
+- **Use cases**: Periodic audit of enforcement decisions, false positive
+  detection, identifying unanticipated bypass patterns
+- **Review**: `grep block /tmp/.pm_enforcement_*.log` to see what's
+  being caught across sessions
+
+This is complementary to `HOOK_DEBUG_PM=1`: debug mode is for
+interactive troubleshooting, log mode is for post-session analysis.
 
 ## Risks and Mitigations
 
@@ -829,6 +1156,34 @@ Patterns" section). The risk was eliminated by design rather than mitigated.
 - Lock file migration tooling
 - CLAUDE.md documentation updates (this ADR serves as documentation)
 
+## Consequences
+
+### Positive
+
+- Enforces consistent lockfile format and dependency tree per ecosystem
+- Catches package manager drift that CLAUDE.md alone cannot prevent
+- Configurable per-ecosystem with three-position model (block/warn/off)
+- Unified allowlist architecture for all 6 tools — extensible and maintainable
+- Fail-open design ensures broken hooks never block legitimate Bash commands
+
+### Negative
+
+- Legitimate pip/npm use is blocked (e.g., pip in a conda environment where
+  uv is not appropriate) — mitigated by per-ecosystem toggle and allowlists
+- Adoption friction for new team members unfamiliar with the enforcement
+  mechanism — mitigated by clear block messages with replacement commands
+- Compound command false positives for here-docs, comments, and strings
+  — accepted trade-off (see D7)
+- Warn mode provides weaker enforcement for AI agents than for human
+  developers — command executes before warning is processed (see D2)
+
+### Neutral
+
+- Does not address runtime enforcement (node vs bun) — intentionally scoped
+  to package managers only (see D6)
+- The `{\"decision\": \"approve|block\"}` schema convention is separate from
+  this ADR (see [ADR: Hook Schema Convention](adr-hook-schema-convention.md))
+
 ## Rollback and Emergency Disable
 
 Three methods for disabling enforcement, ordered by granularity:
@@ -858,6 +1213,10 @@ Three methods for disabling enforcement, ordered by granularity:
 - [ ] Update `.claude/hooks/README.md` with new hook documentation
 - [ ] Add `[hook:block]` to README.md severity table (new prefix for
   PreToolUse blocks, extending existing `[hook:error/warning/advisory]`)
+- [ ] Create prerequisites check script (`test_hook.sh --check-deps` or
+  standalone `check-prerequisites.sh`) that verifies jaq, uv, bun, and
+  other required/optional tools are installed, with actionable install
+  commands for missing ones
 - [ ] Verify all existing tests still pass after changes
 
 ---
@@ -876,5 +1235,25 @@ Three methods for disabling enforcement, ordered by granularity:
 - [Bun v1.1.27 release notes (bun pm pack)](https://bun.com/blog/bun-v1.1.27)
 - [Bun v1.1.30 release notes (bun publish, bun pm whoami)](https://bun.com/blog/bun-v1.1.30)
 - [Stack Overflow - bash =~ uses ERE, not PCRE](https://stackoverflow.com/questions/27476347/matching-word-boundary-with-bash-regex)
-- [bun audit documentation](https://bun.com/docs/pm/cli/audit)
 - [bun info / bun pm view documentation](https://bun.com/docs/pm/cli/info)
+- [Bun GitHub Releases (latest v1.3.9)](https://github.com/oven-sh/bun/releases)
+- [uv CLI Reference (no download subcommand)](https://docs.astral.sh/uv/reference/cli)
+- [uv latest release 0.10.4](https://github.com/astral-sh/uv/releases/tag/0.10.4)
+- [Bun publish documentation](https://bun.com/docs/pm/cli/publish)
+- [Bun scopes and registries (no bun login)](https://bun.com/docs/pm/scopes-registries)
+- [Bun audit hangs indefinitely (#20800)](https://github.com/oven-sh/bun/issues/20800)
+- [Bun audit fix request (#20238)](https://github.com/oven-sh/bun/issues/20238)
+- [Bun publish CI auth failure (#24124)](https://github.com/oven-sh/bun/issues/24124)
+- [Bun publish GitHub Package Registry failure (#15245)](https://github.com/oven-sh/bun/issues/15245)
+- [Bun publish custom registry failure (#18670)](https://github.com/oven-sh/bun/issues/18670)
+- [Bun pm pack prepack script issue (#24314)](https://github.com/oven-sh/bun/issues/24314)
+- [Bun pm pack bundledDependencies issue (#16394)](https://github.com/oven-sh/bun/issues/16394)
+- [Bun audit --prod monorepo issue (#26675)](https://github.com/oven-sh/bun/issues/26675)
+- [Bun pm whoami confusion (#22614)](https://github.com/oven-sh/bun/issues/22614)
+- [npm to bun migration guide](https://bun.com/docs/guides/install/from-npm-install-to-bun-install)
+- [jaq GitHub repository - project self-description](https://github.com/01mf02/jaq)
+- [Bun text-based lockfile announcement (bun.lock)](https://bun.com/blog/bun-lock-text-lockfile)
+- [Bun lockfile documentation](https://bun.com/docs/pm/lockfile)
+- [uv pip compatibility documentation](https://docs.astral.sh/uv/pip/compatibility/)
+- [Bun v1.3.9 latest release](https://github.com/oven-sh/bun/releases/tag/bun-v1.3.9)
+- [uv installation documentation](https://docs.astral.sh/uv/getting-started/installation/)
