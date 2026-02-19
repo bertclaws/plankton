@@ -49,4 +49,4 @@ Fix the code, not the rules.
 - **PreToolUse**: Blocks modifications to linter config files and hook scripts
 - **Stop**: Checks for config file modifications at session end
 
-See `.claude/hooks/README.md` for detailed hook documentation.
+See `docs/README.md` for detailed hook documentation.

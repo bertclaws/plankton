@@ -25,6 +25,7 @@
 #   2 - Issues remain after delegation attempt
 
 set -euo pipefail
+trap 'kill 0' SIGTERM
 
 # Fail-open if jaq is not installed (required for JSON parsing)
 if ! command -v jaq >/dev/null 2>&1; then

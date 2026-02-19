@@ -1,4 +1,4 @@
-# Claude Code Hooks - Portable Template
+# Plankton - Claude Code Hooks
 
 A ready-to-use template for Claude Code hook-based code quality enforcement.
 Provides automated linting, formatting, and code quality checks that run
@@ -40,7 +40,7 @@ during Claude Code sessions.
 | `approve_configs.sh` | Helper | Creates guard file for stop hook |
 | `test_hook.sh` | Debug | Self-test suite for hook validation |
 | `config.json` | Config | Runtime configuration for all hooks |
-| `README.md` | Docs | Detailed hook documentation |
+| `README.md` | Docs | Detailed hook documentation (at `docs/README.md`) |
 
 ### Linter Configurations
 

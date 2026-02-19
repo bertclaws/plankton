@@ -24,7 +24,7 @@
           {
             "type": "command",
             "command": ".claude/hooks/multi_linter.sh",
-            "timeout": 60
+            "timeout": 600
           }
         ]
       }

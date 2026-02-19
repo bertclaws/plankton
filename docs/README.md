@@ -1,7 +1,7 @@
-# Claude Code Hooks - Multi-Linter System
+# Plankton - Multi-Linter Hook System
 
-This directory contains Claude Code hooks for automated code quality
-enforcement.
+Architecture and reference documentation for the Claude Code hooks that provide
+automated code quality enforcement. The hook scripts live in `.claude/hooks/`.
 
 ## Architecture
 
@@ -9,14 +9,14 @@ enforcement.
 PreToolUse (Edit/Write)     PostToolUse (Edit/Write)           Stop (session end)
          |                           |                                |
          v                           v                                v
-protect_linter_configs.sh   multi_linter.sh       Prompt Hook
-         |                    (Three Phases)               |
-         v                         |                       v
-   File protected?       +---------+---------+       Reviews for
-    +- YES -> Block      |         |         |       unresolved
-    +- NO -> Allow   Phase 1   Phase 2   Phase 3       issues
-                      Auto-fmt  Collect   Delegate         |
-                      (silent)  (JSON)    + Verify      v
+protect_linter_configs.sh   multi_linter.sh       stop_config_guardian.sh
+         |                    (Three Phases)          (Command Hook)
+         v                         |                       |
+   File protected?       +---------+---------+             v
+    +- YES -> Block      |         |         |       Detects config
+    +- NO -> Allow   Phase 1   Phase 2   Phase 3     changes via
+                      Auto-fmt  Collect   Delegate    git diff
+                      (silent)  (JSON)    + Verify         |
                                               {decision: approve/block}
                           |         |         |
                           v         v         v
@@ -131,6 +131,7 @@ Edit/Write on *.py
 |  2d. flake8 --select=PYD (Pydantic validation)               |
 |  2e. vulture (dead code detection)                           |
 |  2f. bandit (security scanning)                              |
+|  2g. flake8-async (async anti-patterns, ASYNC100+)           |
 +--------------------------------------------------------------+
        |
        v
@@ -395,14 +396,14 @@ The hook (bash script) sees:
 
 ## All Possible Messages
 
-| # | Message | Line | Trigger | Dest |
+| # | Message | Location | Trigger | Dest |
 | --- | --- | --- | --- | --- |
 | 1 | Hook input JSON | stdin | Always | Hook |
-| 2 | Subprocess prompt | 100-113 | has_issues | Subprocess |
-| 3 | `[hook:advisory]...` | 357-364 | jscpd clones | stderr |
-| 4 | `[hook:warning]...` | 479 | Old hadolint | stderr |
-| 5 | `[hook:error]...` | 131 | No claude | stderr |
-| 6 | `[hook] N remain` | 603 | Verify fails | stderr |
+| 2 | Subprocess prompt | `spawn_fix_subprocess()` | has_issues | Subprocess |
+| 3 | `[hook:advisory]...` | `_handle_jscpd_ts_session()` | jscpd | stderr |
+| 4 | `[hook:warning]...` | Dockerfile handler | Old hadolint | stderr |
+| 5 | `[hook:error]...` | `spawn_fix_subprocess()` | No claude | stderr |
+| 6 | `[hook] N remain` | Main verification flow | Verify fails | stderr |
 
 ## Exit Code Strategy
 
@@ -602,7 +603,7 @@ MAIN AGENT                          HOOK                              SUBPROCESS
 
 | Type | Phase 1: Auto-Format | Phase 2: Collect Violations |
 | --- | --- | --- |
-| Python | `ruff format` + `--fix` | Ruff+ty+pydantic+vulture+bandit*** |
+| Python | `ruff format` + `--fix` | Ruff+ty+pydantic+vulture+bandit+async*** |
 | Shell | `shfmt -w` | ShellCheck semantic |
 | TS/JS/CSS | `biome check --write` | Biome lint+nursery+Semgrep+jscpd** |
 | JSON | `jaq '.'` or `biome format`* | Syntax errors |
@@ -628,7 +629,7 @@ instead of just the edited file.
 
 **\*\*\* jscpd runs in advisory mode** - reports duplicates but does not block.
 Session-scoped (runs once after 3+ Python files modified). See "Note on jscpd"
-below for details.
+below for details. flake8-async checks for async anti-patterns (ASYNC100+).
 
 **Dockerfile Pattern Matching:** The hook recognizes these patterns:
 
@@ -654,6 +655,8 @@ The subprocess (Phase 3) uses different strategies depending on violation type:
 | D401 (imperative mood) | Sonnet | Rewrite "Returns" -> "Return" |
 | D417 (missing Args) | Sonnet | Add Args section from signature |
 | D205/D400/D415 | Sonnet | Fix formatting/punctuation |
+| ASYNC100+ (async anti-patterns) | Sonnet | Fix async/await misuse |
+| FAST001-003 (FastAPI patterns) | Sonnet | Fix FastAPI-specific issues |
 
 **Important**: The subprocess prioritizes linter satisfaction over code
 preservation. It will delete entire functions or imports if that's the
@@ -674,6 +677,8 @@ many issues silently:
 | Indentation (Python) | Unresolved imports |
 | JSON/TOML formatting | ShellCheck semantic issues |
 | D400/D415 (punctuation)** | D401/D417 (semantic docstrings) |
+| | Async anti-patterns (ASYNC100+) |
+| | FastAPI patterns (FAST001-003) |
 
 *F841 has an "unsafe" fix in ruff that Phase 1 skips; subprocess handles it.
 **D400/D415 have auto-fixes in ruff; D401/D417 require semantic understanding.
@@ -687,7 +692,7 @@ many issues silently:
 | `stop_config_guardian.sh` | Stop hook - detects config changes |
 | `approve_configs.sh` | Helper - creates guard file for stop hook |
 | `test_hook.sh` | Debug utility with `--self-test` suite |
-| `README.md` | This documentation |
+| `config.json` | Runtime configuration for all hooks |
 
 ## Debugging
 
@@ -860,19 +865,27 @@ If the file is missing, all features are enabled with sensible defaults.
 
 | Key | Type | Default | Purpose |
 | --- | ---- | ------- | ------- |
-| `languages.<type>` | bool | true | Per-language toggle |
-| `languages.typescript` | object | — | TS/JS/CSS config |
-| `…typescript.enabled` | bool | false | Enable TS/JS/CSS |
-| `…typescript.js_runtime` | string | "auto" | auto/node/bun/pnpm |
-| `…typescript.biome_nursery` | string | "warn" | off/warn/error |
-| `…typescript.semgrep` | bool | true | Semgrep session scan |
-| `protected_files` | str[] | 14 configs | Protected from edits |
-| `exclusions` | str[] | tests/,… | Security lint exclusions |
+| `languages.<type>` | bool | true | Per-language on/off toggle |
+| `languages.typescript` | object | — | TS/JS/CSS config (sub-options below) |
+| `…typescript.enabled` | bool | false | Enable TS/JS/CSS linting |
+| `…typescript.js_runtime` | string | "auto" | JS runtime: auto/node/bun/pnpm |
+| `…typescript.biome_nursery` | string | "warn" | Nursery: off/warn/error |
+| `…ts.biome_unsafe_autofix` | bool | false | Allow Biome unsafe fixes |
+| `…ts.oxlint_tsgolint` | bool | false | Enable oxlint/tsgolint |
+| `…typescript.tsgo` | bool | false | Enable tsgo type checking |
+| `…typescript.semgrep` | bool | true | Semgrep session scan for TS/JS |
+| `…typescript.knip` | bool | false | Enable Knip dead code detection |
+| `protected_files` | str[] | 14 configs | Linter configs protected from edits |
+| `exclusions` | str[] | tests/,… | Directories excluded from security linters |
 | `phases.auto_format` | bool | true | Phase 1 auto-format |
-| `phases.subprocess_delegation` | bool | true | Phase 3 subprocess |
-| `subprocess.timeout` | number | 300 | Timeout (seconds) |
-| `subprocess.model_selection.*` | varies | varies | Model routing patterns |
-| `jscpd.*` | varies | varies | Duplicate detection |
+| `phases.subprocess_delegation` | bool | true | Phase 3 subprocess delegation |
+| `subprocess.timeout` | number | 300 | Subprocess timeout (seconds) |
+| `subprocess.model.sonnet` | string | (regex) | Codes routed to Sonnet |
+| `subprocess.model.opus` | string | (regex) | Codes routed to Opus |
+| `subprocess.model.volume` | number | 5 | Count that triggers Opus |
+| `jscpd.session_threshold` | number | 3 | Files modified before jscpd runs |
+| `jscpd.scan_dirs` | str[] | ["src/","lib/"] | Dirs to scan for dupes |
+| `jscpd.advisory_only` | bool | true | Report-only mode (no blocking) |
 
 ### Example: Disable Markdown Linting
 
@@ -911,9 +924,16 @@ The hooks use a two-layer protection strategy:
   - `taplo.toml`
   - `.ruff.toml`
   - `ty.toml`
+  - `biome.json`
+  - `.oxlintrc.json`
+  - `.semgrep.yml`
+  - `knip.json`
   - `.claude/hooks/*` (entire hooks directory)
   - `.claude/settings.json` (Claude Code settings)
   - `.claude/settings.local.json` (local overrides)
+- Some protected files (e.g., `biome.json`, `.oxlintrc.json`, `.semgrep.yml`,
+  `knip.json`) may not yet exist in the repo but are pre-configured so they are
+  immediately protected when the corresponding linter is enabled
 - Returns `{"decision": "block"}` to prevent edit
 - User can explicitly approve blocked edits (override)
 
@@ -1070,6 +1090,10 @@ stop_hook_active=$(jaq -r '.stop_hook_active // false' <<<"${input}")
 
 ## Model Configuration
 
+**Note**: All hooks in this project use command type (`"type": "command"`), not
+prompt type. The model configuration below applies to prompt-type hooks and is
+documented here for reference.
+
 Prompt hooks support an optional `model` field:
 
 ```json
@@ -1091,20 +1115,23 @@ Prompt hooks support an optional `model` field:
 
 - `jaq` - JSON parsing (Rust jq alternative)
 - `ruff` - Python formatting and linting
+- `uv` - Python tool runner (invokes ty, pydantic, vulture, bandit, flake8-async)
 - `claude` - Claude Code CLI (for subprocess delegation)
 
 **Optional (gracefully skipped if not installed):**
 
 - `ty` - Python type checking (Astral's Rust-based type checker)
-- `pydantic` - Pydantic model linting
+- `pydantic` - Pydantic model linting (via flake8)
 - `vulture` - Dead code detection (uses `vulture_whitelist.py` for false positives)
 - `bandit` - Security scanning (uses `pyproject.toml [tool.bandit]`)
+- `flake8-async` - Async anti-pattern detection (ASYNC100+)
 - `shfmt` - Shell script formatting
 - `shellcheck` - Shell script linting
 - `yamllint` - YAML linting (baseline fully enforced)
 - `hadolint` - Dockerfile linting (>= 2.12.0 recommended)
 - `taplo` - TOML formatting and linting
 - `markdownlint-cli2` - Markdown linting
+- `npx` - Node package runner (used for jscpd and biome auto-detection)
 - `jscpd` - Duplicate code detection (via npx, no install needed)
 - `biome` - TypeScript/JS/CSS formatting and linting (via npm/npx)
 - `semgrep` - Security scanning for TS/JS (session-scoped, advisory)
@@ -1221,25 +1248,30 @@ The subprocess receives a specialized prompt with fix strategies:
 | Sonnet | ~15s | Medium | Good | Refactoring, Pydantic |
 | Opus | ~25s | Highest | Best | Complex types, >5 issues |
 
-### Selection Logic (lines 57-81 in `multi_linter.sh`)
+### Selection Logic (in `spawn_fix_subprocess()`)
 
 ```bash
 model="haiku"  # default
 if [[ has_sonnet_codes ]]; then model="sonnet"; fi
-if [[ has_opus_codes ]] || [[ count > 5 ]]; then model="opus"; fi
+if [[ has_opus_codes ]] || [[ count > volume_threshold ]]; then model="opus"; fi
 ```
 
-### Model Selection Pattern Constants
+### Model Selection Patterns
 
-The sonnet and opus code patterns are defined as readonly constants at the script
-top to ensure consistency between the actual model selection (spawn_fix_subprocess)
-and debug output (HOOK_DEBUG_MODEL=1):
+The sonnet and opus code patterns are loaded dynamically from `config.json` via
+`load_model_patterns()` at startup, with readonly applied after loading. This
+allows pattern customization without editing the script. The defaults (used as
+fallback if config.json is missing) are:
 
 ```bash
-# Single source of truth for model selection patterns
-readonly SONNET_CODE_PATTERN='C901|PLR[0-9]+|PYD[0-9]+|FAST[0-9]+|ASYNC[0-9]+|unresolved-import|MD[0-9]+|D[0-9]+'
-readonly OPUS_CODE_PATTERN='unresolved-attribute|type-assertion'
+# Default patterns (overridden by config.json subprocess.model_selection.*)
+SONNET_CODE_PATTERN='C901|PLR[0-9]+|PYD[0-9]+|FAST[0-9]+|ASYNC[0-9]+|unresolved-import|MD[0-9]+|D[0-9]+'
+OPUS_CODE_PATTERN='unresolved-attribute|type-assertion'
 ```
+
+The actual `config.json` may contain extended patterns (e.g., TypeScript-specific
+Semgrep rule names appended to `sonnet_patterns`). See
+`.claude/hooks/config.json` `subprocess.model_selection` for the current values.
 
 **Pattern Components**:
 
@@ -1254,10 +1286,11 @@ readonly OPUS_CODE_PATTERN='unresolved-attribute|type-assertion'
 | `MD[0-9]+` | Markdown | MD001-MD065 |
 | `D[0-9]+` | Docstrings | D100-D420 |
 
-**Why Constants**: When new linter categories are added (e.g., ASYNC patterns),
-only the constant definition needs updating. See config.json for pattern
-configuration. This prevents the debug regex from getting out of sync with
-the actual model selection logic.
+**Why Dynamic Loading**: Patterns are loaded from `config.json` so new linter
+categories (e.g., ASYNC patterns, TypeScript Semgrep rules) can be added without
+editing the script. The `load_model_patterns()` function applies readonly after
+loading, ensuring consistency between actual model selection and debug output
+(HOOK_DEBUG_MODEL=1).
 
 ## Testing Environment Variables
 
@@ -1280,7 +1313,7 @@ echo '{"tool_input": {"file_path": "/tmp/test.py"}}' \
 
 There are **TWO** debug output blocks for model selection:
 
-1. **Inside spawn_fix_subprocess() (lines 85-87)** - Verbose format with counts:
+1. **Inside `spawn_fix_subprocess()`** - Verbose format with counts:
 
    ```text
    [hook:model] haiku (count=3, opus_codes=false, sonnet_codes=false)
@@ -1288,7 +1321,7 @@ There are **TWO** debug output blocks for model selection:
 
    Only reached during normal execution (when HOOK_SKIP_SUBPROCESS is not set).
 
-2. **Script-level (lines 560-584)** - Simple format:
+2. **Script-level (main flow)** - Simple format:
 
    ```text
    [hook:model] haiku
@@ -1316,7 +1349,10 @@ location.
 | taplo | `taplo.toml` |
 | markdownlint | `.markdownlint.jsonc`, `.markdownlint-cli2.jsonc` |
 | jscpd | `.jscpd.json` (5% threshold) |
+| flake8-async | `.flake8` (shares config with pydantic) |
 | Biome | `biome.json` (TS/JS/CSS formatting + linting) |
+| oxlint | `.oxlintrc.json` (TS/JS linting, when enabled) |
+| Knip | `knip.json` (dead code detection, when enabled) |
 | Semgrep | `.semgrep.yml` (security rules for TS/JS) |
 
 **Note on Taplo:** Auto-formatting is now applied via `taplo fmt`. Only syntax
@@ -1464,11 +1500,12 @@ The hook (bash script) generates structured JSON for two reasons:
 
 **Fragility examples:**
 
-- **yamllint** (lines 428-435): Breaks if message contains `:` or `()`
+- **yamllint** (YAML handler): Breaks if message contains `:` or `()`
   characters, or if level becomes uppercase `[ERROR]`
-- **flake8** (lines 379-386): Breaks if file path contains `:` or code format
+- **flake8** (Python handler): Breaks if file path contains `:` or code format
   changes (e.g., `PYD-002` instead of `PYD002`)
-- **markdownlint** (lines 532-538): Breaks if output format or rule names change
+- **markdownlint** (Markdown handler): Breaks if output format or rule names
+  change
 
 ### Mitigation Options Considered
 
