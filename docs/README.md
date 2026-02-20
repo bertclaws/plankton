@@ -1207,6 +1207,10 @@ The subprocess spawned in Phase 3 uses `--settings ~/.claude/no-hooks-settings.j
 to disable hooks during subprocess execution. The subprocess uses `--settings`
 flag to prevent recursive hook invocation.
 
+**File location**: `~/.claude/no-hooks-settings.json` (user home directory, NOT
+project `.claude/`). This is a global Claude Code settings override, not a
+project-level file.
+
 **Why this is needed:**
 
 - `claude -p` subprocesses inherit hooks from the parent session by default
@@ -1765,3 +1769,74 @@ simultaneously:
 This follows ShellCheck SC2094 guidance: use `if mv ...; then success; else
 cleanup; fi` pattern instead of `mv ... || rm` to ensure the warning message
 only fires for the process that actually created the file.
+
+## Integration Test Suite
+
+The hook system has a 103-test integration suite that exercises all four hooks
+via their real stdin/stdout contracts. The suite runs as three parallel agents
+using Claude Code's TeamCreate feature.
+
+**Specification**: [adr-hook-integration-testing.md](specs/adr-hook-integration-testing.md)
+
+**Results**: [.claude/tests/hooks/results/RESULTS.md](../.claude/tests/hooks/results/RESULTS.md)
+
+### Suite Structure
+
+| Agent | Hook Tested | Tests | Scope |
+| --- | --- | --- | --- |
+| `dep-agent` | Infrastructure | 29 | Dependencies + settings registration |
+| `ml-agent` | `multi_linter.sh` | 42 | All file types, configs, toggles |
+| `pm-agent` | `enforce_package_managers.sh` | 32 | Block/approve/compound/cfg |
+
+**Excluded hooks**: `protect_linter_configs.sh` is covered by the
+`test_hook.sh --self-test` suite. `stop_config_guardian.sh` requires an
+interactive session restart which cannot be triggered from a TeamCreate
+teammate context (teammates fire `TeammateIdle`, not `Stop`).
+
+### Two Test Layers
+
+- **Layer 1 (stdin/stdout)**: Pipe JSON to the hook script, capture exit
+  code and output. This is the real execution path — identical to how Claude
+  Code delivers input to hooks.
+- **Layer 2 (live trigger)**: Invoke an actual tool call (Edit or Bash) and
+  observe whether the hook fires via the tool result.
+
+### Running the Suite
+
+The suite is orchestrated by the main agent following the
+[Orchestrator Playbook](specs/adr-hook-integration-testing.md#orchestrator-playbook).
+Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` environment variable.
+
+```text
+Phase 0: Archive previous results, create team
+Phase 1: dep-agent pre-flight (DEP01-DEP29)
+Phase 2: ml-agent + pm-agent in parallel (M01-M42, P01-P32)
+Phase 3: Aggregate JSONL, write RESULTS.md
+Phase 4: Compare with archived previous run (if available)
+```
+
+Results are written as JSONL to `.claude/tests/hooks/results/` with one file
+per agent. The aggregation command (`jaq -s`) produces pass/fail/skip counts
+across all 103 tests.
+
+### Known Limitations
+
+**PreToolUse hooks do not fire for TeamCreate teammate Bash tool calls**:
+When a teammate agent uses the Bash tool, PreToolUse hooks registered in
+`.claude/settings.json` are not triggered. This means P28 (live trigger
+for `enforce_package_managers.sh`) cannot be validated in a teammate
+session. PostToolUse hooks DO fire for teammate Edit/Write tool calls
+(confirmed by M19). This is a Claude Code agent teams architecture
+constraint, not a hook defect — all 31 direct invocation tests confirm
+the hook logic is correct.
+
+**no-hooks-settings.json path**: The subprocess prevention settings file
+lives at `~/.claude/no-hooks-settings.json` (user home directory). The
+integration test spec (DEP14) must check this path, not the project-local
+`.claude/no-hooks-settings.json`. The hook auto-creates this file if
+missing (see Settings File Auto-Creation above).
+
+**Stop hook untestable via TeamCreate**: The `stop_config_guardian.sh` hook
+fires on the `Stop` lifecycle event, which occurs at session end. TeamCreate
+teammates trigger `TeammateIdle` when they finish, not `Stop`. Testing the
+stop hook requires a manual interactive session (see Testing Stop Hook above).
