@@ -11,7 +11,7 @@ without a verifiable source are marked `[verify: unresolved]`.
 
 **Document type**: This is a hybrid ADR/test-specification. The
 decisions (D1–D11) capture architectural choices; the test case
-inventories (M01–M19, P01–P28, DEP01–DEP20) are the operational
+inventories (M01–M38, P01–P28, DEP01–DEP24) are the operational
 specification that flows from those decisions. The document is
 designed for direct consumption by an orchestrator agent that will
 create an execution plan and run the test suite.
@@ -83,6 +83,13 @@ excluded from dedicated agents:
 | **3 agents (ml + pm + dep)** | Balanced | Slightly more setup | **Yes** |
 | Single agent | Simplest | No parallelism | No |
 
+**Execution ordering**: dep-agent runs first as a pre-flight
+environment check (~5 seconds). If required tools (jaq, ruff, uv,
+claude) are absent, the orchestrator aborts before spawning ml-agent
+or pm-agent. If only Biome is absent, the orchestrator continues —
+ml-agent will fail M15–M18 per D4, which is the intended behavior.
+After dep-agent completes, ml-agent and pm-agent run in parallel.
+
 **Rationale**: The dep audit agent is lightweight but catches
 environment issues (wrong tool version, missing jaq, unregistered
 hook) that would silently degrade behavior without triggering a
@@ -112,6 +119,18 @@ rm -f "${tmp}"
 # ... assert exit_code == 2, result contains [hook] ...
 ```
 
+**Temp file cleanup guarantee**: Each agent sets a cleanup trap at
+startup to handle orphaned temp files from timed-out tests:
+
+```bash
+trap 'rm -f /tmp/hook_test_*' EXIT
+```
+
+Individual tests still clean up after themselves (`rm -f "${tmp}"`),
+but the trap ensures cleanup even when `timeout` kills a test
+before its cleanup line executes. The parent process (agent) always
+runs the EXIT trap regardless of how child processes terminate.
+
 **Alternatives considered**:
 
 | Option | Pros | Cons | Verdict |
@@ -140,7 +159,7 @@ echo '{"tool_input": {"file_path": "/tmp/test.py"}}' \
 
 This IS the real execution path — Claude Code delivers input to
 hooks as JSON on stdin; the hook returns JSON stdout and exit code.
-[verify: docs/README.md §Input/Output Contract]
+[verify: docs/README.md §Testing Hooks Manually, §Hook Schema Reference]
 
 **Layer 2 — Live in-session trigger**:
 
@@ -176,7 +195,9 @@ registration, not just the script's stdin/stdout behavior.
 ### D4: ml-agent Test Scope — All File Types
 
 **Decision**: ml-agent tests all file types that multi_linter.sh
-handles [verify: docs/README.md §Linter Behavior by File Type].
+handles [verify: docs/README.md §Linter Behavior by File Type],
+plus conflict/interaction scenarios (M24–M31) and cross-language
+toggle tests (M32–M38).
 
 Each file type has at minimum a **clean test** (expect exit 0) and
 a **violation test** (expect exit 2 with `[hook]` on stderr).
@@ -196,6 +217,12 @@ a **violation test** (expect exit 2 with `[hook]` on stderr).
 | JavaScript `.js` | M17 | — | Clean only |
 | CSS `.css` | M18 | — | Clean only |
 
+**JS/CSS clean-only rationale**: Biome handles TypeScript, JavaScript,
+and CSS with the same engine. The M16 TypeScript violation test covers
+the violation detection code path for all three languages. M17/M18
+confirm that clean files of each type are accepted without false
+positives.
+
 **TypeScript/JS/CSS gate**: These tests require Biome
 [verify: docs/README.md §Dependencies §Optional]. If `biome` or
 `npx biome` is not found, log M15–M18 as
@@ -205,6 +232,16 @@ explicit requirement. Tests M15–M18 use a `CLAUDE_PROJECT_DIR`
 override pointing to a temp directory containing a `config.json`
 with `typescript.enabled: true` (matching the project's current
 default config).
+
+**Config isolation guarantee (ml-agent)**: Config-dependent tests
+(M15–M18 and M20–M23) each create their own temp directory with a
+custom `config.json` and set `CLAUDE_PROJECT_DIR` as a per-process
+environment variable on the hook subprocess invocation. This provides
+process-level isolation — ml-agent's config overrides cannot affect
+pm-agent or dep-agent running concurrently, because environment
+variable prefixes (`CLAUDE_PROJECT_DIR=/tmp/foo bash hook.sh`) scope
+to that specific subprocess only. Same mechanism as pm-agent's P25–P27
+(see D5 Config mode cases).
 
 **Subprocess control**: All violation tests use
 `HOOK_SKIP_SUBPROCESS=1` for deterministic exit codes. Without it,
@@ -233,7 +270,7 @@ echo '{
 ```
 
 [verify: .claude/hooks/enforce_package_managers.sh §input parsing,
-docs/README.md §Input/Output Contract]
+docs/specs/adr-package-manager-enforcement.md §Input/Output Contract]
 
 **Block cases** (expected: `decision: "block"`, exit 0):
 
@@ -328,12 +365,22 @@ PreToolUse hook blocks the command.
 | DEP08 | `hadolint` | Optional | `command -v hadolint` | — |
 | DEP09 | `hadolint` version | Optional | `hadolint --version` | ≥ 2.12.0 |
 | DEP10 | `taplo` | Optional | `command -v taplo` | — |
-| DEP11 | `biome` | Optional | `command -v biome` | — |
+| DEP11 | `biome` | Required* | `command -v biome \|\| npx biome --version` | — |
 | DEP12 | `semgrep` | Optional | `command -v semgrep` | — |
+| DEP13 | `markdownlint-cli2` | Optional | `command -v markdownlint-cli2` | — |
+| DEP23 | `oxlint` | Optional | `command -v oxlint` | — |
+| DEP24 | `bandit` | Optional | `command -v bandit` | — |
 
 For Required tools: `pass: false` if absent.
+For Required* tools (DEP11): `pass: false` if absent. Biome is
+optional for daily hook operation but required for this test suite
+per D4 — ml-agent tests M15–M18 hard-fail without it.
 For Optional tools: `pass: true` with `note: "absent"` if absent
 (absence is expected and graceful).
+DEP23 (oxlint): needed for M26 (`ts_combined_config`) which tests
+biome + oxlint interaction. If absent, M26 is skipped.
+DEP24 (bandit): needed for M31 (`py_multi_tool`) which tests
+multi-tool Phase 2 collection. If absent, M31 is skipped.
 For DEP09: `pass: false` if hadolint found but version < 2.12.0.
 [verify: docs/README.md §hadolint Version Check]
 
@@ -350,17 +397,28 @@ For DEP09: `pass: false` if hadolint found but version < 2.12.0.
 
 | ID | Check | Expected |
 | --- | --- | --- |
-| DEP13 | `~/.claude/no-hooks-settings.json` exists | exists |
-| DEP14 | PreToolUse `Edit\|Write` entry | protect_linter_configs.sh |
-| DEP15 | PreToolUse `Bash` entry | enforce_package_managers.sh |
-| DEP16 | PostToolUse `Edit\|Write` entry | multi_linter.sh |
-| DEP17 | Stop entry | stop_config_guardian.sh |
-| DEP18 | `.claude/hooks/config.json` exists | exists |
-| DEP19 | `config.json` has `package_managers.python` | present |
-| DEP20 | `config.json` has `package_managers.javascript` | present |
+| DEP14 | `~/.claude/no-hooks-settings.json` exists and contains `"disableAllHooks": true` | exists + content valid |
+| DEP15 | PreToolUse `Edit\|Write` entry | protect_linter_configs.sh |
+| DEP16 | PreToolUse `Bash` entry | enforce_package_managers.sh |
+| DEP17 | PostToolUse `Edit\|Write` entry | multi_linter.sh |
+| DEP18 | Stop entry | stop_config_guardian.sh |
+| DEP19 | `.claude/hooks/config.json` exists | exists |
+| DEP20 | `config.json` has `package_managers.python` | present |
+| DEP21 | `config.json` has `package_managers.javascript` | present |
 
 [verify: .claude/settings.json, docs/README.md §Runtime
 Configuration, docs/README.md §Subprocess Hook Prevention]
+
+**Category C — Test infrastructure**:
+
+| ID | Tool | Required | Check |
+| --- | --- | --- | --- |
+| DEP22 | `timeout` | Yes | `command -v timeout \|\| command -v gtimeout` |
+
+`timeout` (GNU coreutils) is required for per-test timeout
+enforcement. On macOS, install via `brew install coreutils`.
+If `gtimeout` is found instead of `timeout`, agents should use
+`gtimeout` as a drop-in replacement.
 
 ### D7: Log Format — JSONL
 
@@ -380,9 +438,12 @@ three agents complete.
   "expected_exit": 2,
   "actual_decision": "exit_2",
   "actual_exit": 2,
-  "actual_output": "[hook] 1 violation(s) remain after delegation",
+  "actual_output": "",
+  "actual_stderr": "[hook] 1 violation(s) remain after delegation",
   "pass": true,
-  "note": ""
+  "note": "",
+  "timestamp": "2026-02-20T14:30:22Z",
+  "duration_ms": 1000
 }
 ```
 
@@ -399,8 +460,11 @@ For pm-agent tests (JSON stdout hooks):
   "actual_decision": "block",
   "actual_exit": 0,
   "actual_output": "{\"decision\":\"block\",\"reason\":\"...\"}",
+  "actual_stderr": "",
   "pass": true,
-  "note": ""
+  "note": "",
+  "timestamp": "2026-02-20T14:30:45Z",
+  "duration_ms": 2000
 }
 ```
 
@@ -417,8 +481,11 @@ For dep-agent tests:
   "actual_decision": "present",
   "actual_exit": 0,
   "actual_output": "/opt/homebrew/bin/jaq",
+  "actual_stderr": "",
   "pass": true,
-  "note": ""
+  "note": "",
+  "timestamp": "2026-02-20T14:29:58Z",
+  "duration_ms": 0
 }
 ```
 
@@ -435,8 +502,11 @@ For live trigger tests (Layer 2):
   "actual_decision": "hook_fired",
   "actual_exit": null,
   "actual_output": "PostToolUse:Edit hook succeeded: Success",
+  "actual_stderr": "",
   "pass": true,
-  "note": "Layer 2: confirmed hook lifecycle registration"
+  "note": "Layer 2: confirmed hook lifecycle registration",
+  "timestamp": "2026-02-20T14:31:10Z",
+  "duration_ms": 3000
 }
 ```
 
@@ -444,6 +514,14 @@ The `category: "live_trigger"` distinguishes Layer 2 from Layer 1
 tests. Fields that don't apply to live trigger tests use `null`.
 The `expected_decision: "hook_fired"` means either exit 0 or exit 2
 confirms the hook ran — both are a pass.
+
+**`actual_stderr` field**: Captures stderr output separately from
+stdout. For PostToolUse hooks (ml-agent), stderr carries `[hook]`
+violation messages. For PreToolUse hooks (pm-agent), stdout carries
+the JSON decision and stderr carries `[hook:advisory]` warn-mode
+messages. Tests that assert on advisory content (e.g., P26
+`cfg_py_warn`) check `actual_stderr`. Capture pattern:
+`actual_output=$(cmd 2>stderr_tmp); actual_stderr=$(cat stderr_tmp)`.
 
 **Alternatives considered**:
 
@@ -572,7 +650,7 @@ must return zero matches before acceptance.
 
 ## Complete Test Case Inventory
 
-### ml-agent Test Cases (22 total)
+### ml-agent Test Cases (38 total)
 
 All violation tests use `HOOK_SKIP_SUBPROCESS=1`
 [verify: docs/README.md §Testing Environment Variables].
@@ -591,33 +669,94 @@ M20 verifies [verify: .claude/hooks/multi_linter.sh §_lint_typescript
 `biome_unsafe_autofix` branch, §rerun_phase1 `_unsafe` flag].
 M21 verifies [verify: .claude/hooks/multi_linter.sh §_lint_typescript
 `oxlint_tsgolint` Biome --skip logic].
-M22 is a defensive smoke test for deferred settings (tsgo, knip) that
-have no implementation yet — confirms enabling them doesn't crash.
+M22 is a defensive smoke test for tsgo (deferred, no implementation)
+— confirms enabling it doesn't crash the hook.
+M23 is the same defensive smoke test for knip (deferred, no
+implementation) — split from M22 for per-setting attribution.
 
-| ID | Name | Fixture | Expected |
-| --- | --- | --- | --- |
-| M01 | python_clean | Clean `.py` | exit 0 |
-| M02 | python_f841 | Unused var | exit 2, `[hook]` |
-| M03 | shell_clean | Clean `.sh` | exit 0 |
-| M04 | shell_sc2086 | Unquoted `$VAR` | exit 2, `[hook]` |
-| M05 | markdown_clean | Clean `.md` | exit 0 |
-| M06 | markdown_md013 | Line >80 chars | exit 2, `[hook]` |
-| M07 | yaml_clean | Clean `.yaml` | exit 0 |
-| M08 | yaml_indent | Wrong indentation | exit 2, `[hook]` |
-| M09 | toml_clean | Clean `.toml` | exit 0 |
-| M10 | toml_invalid | Syntax error | exit 2, `[hook]` |
-| M11 | json_clean | Valid `.json` | exit 0 |
-| M12 | json_invalid | Malformed JSON | exit 2, `[hook]` |
-| M13 | dockerfile_clean | Clean Dockerfile | exit 0 |
-| M14 | dockerfile_dl3007 | `FROM ubuntu:latest` | exit 2, `[hook]` |
-| M15 | ts_clean | Clean `.ts` | exit 0 |
-| M16 | ts_unused_var | Unused variable | exit 2, `[hook]` |
-| M17 | js_clean | Clean `.js` | exit 0 |
-| M18 | css_clean | Clean `.css` | exit 0 |
-| M19 | live_trigger | Edit `.py` via tool | hook fires |
-| M20 | biome_unsafe_on | Clean `.ts` + `biome_unsafe_autofix: true` | exit 0 |
-| M21 | oxlint_skip_rules | Clean `.ts` + `oxlint_tsgolint: true` | exit 0 |
-| M22 | deferred_safe | Clean `.ts` + `tsgo: true, knip: true` | exit 0 |
+| ID | Name | Fixture | Expected | Gate |
+| --- | --- | --- | --- | --- |
+| M01 | python_clean | Clean `.py` | exit 0 | — |
+| M02 | python_f841 | Unused var | exit 2, `[hook]` | — |
+| M03 | shell_clean | Clean `.sh` | exit 0 | — |
+| M04 | shell_sc2086 | Unquoted `$VAR` | exit 2, `[hook]` | shellcheck |
+| M05 | markdown_clean | Clean `.md` | exit 0 | — |
+| M06 | markdown_md013 | Line >80 chars | exit 2, `[hook]` | markdownlint-cli2 |
+| M07 | yaml_clean | Clean `.yaml` | exit 0 | — |
+| M08 | yaml_indent | Wrong indentation | exit 2, `[hook]` | yamllint |
+| M09 | toml_clean | Clean `.toml` | exit 0 | — |
+| M10 | toml_invalid | Syntax error | exit 2, `[hook]` | taplo |
+| M11 | json_clean | Valid `.json` | exit 0 | — |
+| M12 | json_invalid | Malformed JSON | exit 2, `[hook]` | — |
+| M13 | dockerfile_clean | Clean Dockerfile | exit 0 | — |
+| M14 | dockerfile_dl3007 | `FROM ubuntu:latest` | exit 2, `[hook]` | hadolint |
+| M15 | ts_clean | Clean `.ts` | exit 0 | biome\* |
+| M16 | ts_unused_var | Unused variable | exit 2, `[hook]` | biome\* |
+| M17 | js_clean | Clean `.js` | exit 0 | biome\* |
+| M18 | css_clean | Clean `.css` | exit 0 | biome\* |
+| M19 | live_trigger | Edit `.py` via tool | hook fires | — |
+| M20 | biome_unsafe_on | Clean `.ts` + `biome_unsafe_autofix: true` | exit 0 | biome\* |
+| M21 | oxlint_skip_rules | Clean `.ts` + `oxlint_tsgolint: true` | exit 0 | biome\* |
+| M22 | tsgo_safe | Clean `.ts` + `tsgo: true` | exit 0 | biome\* |
+| M23 | knip_safe | Clean `.ts` + `knip: true` | exit 0 | biome\* |
+
+`biome*` = Required for this test suite; absence is failure, not
+skip (see D4). All other gates: absence triggers skip with
+`pass: true, note: "absent"`.
+
+**Conflict/interaction tests (M24–M31)**: These tests exercise code
+paths where multiple linters, config flags, or pipeline phases interact
+on the same file. All use `HOOK_SKIP_SUBPROCESS=1` unless noted.
+All use `CLAUDE_PROJECT_DIR` overrides for config-dependent tests.
+
+| ID | Name | Fixture | Expected | Gate |
+| --- | --- | --- | --- | --- |
+| M24 | py_multi_violation | Python: F841 + type error | exit 2, multiple violations collected | — |
+| M25 | py_format_stable | Badly-formatted clean Python | exit 0 (Phase 1 formats, Phase 2 clean) | — |
+| M26 | ts_combined_config | TS violation + `unsafe:true` + `oxlint:true` | exit 2 | biome\*, oxlint |
+| M27 | py_no_autoformat | Python F841 + `auto_format: false` | exit 2 | — |
+| M28 | ts_nursery_error | TS nursery violation + `nursery: "error"` | exit 2 | biome\* |
+| M29 | py_no_subprocess | Python F841 + `subprocess_delegation: false` | exit 2 | — |
+| M30 | ts_unsafe_resolves | TS violation fixable by `--unsafe` + `unsafe:true` | exit 0 (Phase 1 fixes) | biome\* |
+| M31 | py_multi_tool | Python: `assert True` (B101) + unused var (F841) | exit 2, multi-tool | bandit |
+
+M24 verifies [verify: docs/README.md §Python File Flow Detail §Phase 2].
+M25 verifies [verify: docs/README.md §Phase 1 Auto-Format,
+§Python File Flow Detail].
+M26 verifies [verify: .claude/hooks/multi_linter.sh §_lint_typescript,
+config interaction].
+M27 verifies [verify: .claude/hooks/config.json §phases.auto_format].
+M28 verifies [verify: .claude/hooks/multi_linter.sh §nursery_count
+blocking path].
+M29 verifies [verify: .claude/hooks/config.json
+§phases.subprocess_delegation].
+M30 verifies [verify: .claude/hooks/multi_linter.sh §_lint_typescript
+Phase 1 --unsafe path].
+M31 verifies [verify: docs/README.md §Python File Flow Detail
+§Phase 2 bandit + ruff].
+
+**Cross-language / language toggle tests (M32–M38)**: These tests
+verify that `languages.<type>: false` in `config.json` causes the hook
+to passthrough (exit 0) even for files with violations. Each test
+creates a violation fixture identical to an earlier test but with the
+language disabled via `CLAUDE_PROJECT_DIR` override. All use
+`HOOK_SKIP_SUBPROCESS=1`. M38 tests the fallback path for unrecognized
+file extensions.
+
+| ID | Name | Fixture | Config Override | Expected | Gate |
+| --- | --- | --- | --- | --- | --- |
+| M32 | lang_py_disabled | Python F841 | `python: false` | exit 0 | — |
+| M33 | lang_ts_disabled | TS unused var | `typescript.enabled: false` | exit 0 | — |
+| M34 | lang_shell_disabled | Shell SC2086 | `shell: false` | exit 0 | — |
+| M35 | lang_md_disabled | Markdown MD013 | `markdown: false` | exit 0 | — |
+| M36 | lang_yaml_disabled | YAML indent | `yaml: false` | exit 0 | — |
+| M37 | lang_json_disabled | Invalid JSON | `json: false` | exit 0 | — |
+| M38 | unknown_ext_passthrough | `.xyz` file | Default config | exit 0 | — |
+
+M32–M37 verify [verify: .claude/hooks/multi_linter.sh §language toggle
+check, .claude/hooks/config.json §languages].
+M38 verifies [verify: .claude/hooks/multi_linter.sh §file extension
+routing fallback].
 
 ### pm-agent Test Cases (28 total)
 
@@ -658,23 +797,23 @@ P28 verifies [verify: docs/README.md §Hook Invocation Behavior].
 | P23 | cpd_poet_diag | `poetry -h && poetry add req` | block |
 | P24 | cpd_npm_yarn | `npm audit && yarn add pkg` | block |
 | P25 | cfg_py_off | `pip install` + `python: false` | approve |
-| P26 | cfg_py_warn | `pip install` + `"uv:warn"` | approve+adv |
+| P26 | cfg_py_warn | `pip install` + `"uv:warn"` | approve, `[hook:advisory]` |
 | P27 | cfg_js_off | `npm install` + `js: false` | approve |
 | P28 | live_trigger | `Bash pip install` via tool | hook blocks |
 
-### dep-agent Test Cases (20 total)
+### dep-agent Test Cases (24 total)
 
 README = `docs/README.md`
 
 Required-tool checks (DEP01–DEP04) verify
 [verify: README §Dependencies, README §claude Command Discovery].
-Optional-tool checks (DEP05–DEP12) verify
+Optional-tool checks (DEP05–DEP13, DEP23–DEP24) verify
 [verify: README §Dependencies]. DEP09 additionally checks the
 minimum version [verify: README §hadolint Version Check].
-DEP13 verifies the no-hooks settings file
+DEP14 verifies the no-hooks settings file
 [verify: README §Subprocess Hook Prevention]. Settings keys
-(DEP14–DEP17) verify [verify: .claude/settings.json].
-Config keys (DEP18–DEP20) verify
+(DEP15–DEP18) verify [verify: .claude/settings.json].
+Config keys (DEP19–DEP21) verify
 [verify: README §Runtime Configuration,
 README §Package Manager Enforcement].
 
@@ -690,38 +829,58 @@ README §Package Manager Enforcement].
 | DEP08 | hadolint_opt | `command -v hadolint` | yes/no |
 | DEP09 | hadolint_ver | `hadolint --version` | ≥ 2.12.0 |
 | DEP10 | taplo_opt | `command -v taplo` | yes/no |
-| DEP11 | biome_opt | `command -v biome` | yes/no |
+| DEP11 | biome_opt | `command -v biome \|\| npx biome --version` | yes/no |
 | DEP12 | semgrep_opt | `command -v semgrep` | yes/no |
-| DEP13 | no_hooks | `no-hooks-settings.json` | exists |
-| DEP14 | set_pre_edit | `settings.json` | `Edit\|Write` |
-| DEP15 | set_pre_bash | `settings.json` | `Bash` |
-| DEP16 | set_post | `settings.json` | `PostToolUse` |
-| DEP17 | set_stop | `settings.json` | `Stop` present |
-| DEP18 | cfg_json | `hooks/config.json` | exists |
-| DEP19 | cfg_py_key | `config.json` | `pkg_mgrs.python` |
-| DEP20 | cfg_js_key | `config.json` | `pkg_mgrs.js` |
+| DEP13 | mdlint_opt | `command -v markdownlint-cli2` | yes/no |
+| DEP14 | no_hooks | `no-hooks-settings.json` | exists + `disableAllHooks: true` |
+| DEP15 | set_pre_edit | `settings.json` | `Edit\|Write` |
+| DEP16 | set_pre_bash | `settings.json` | `Bash` |
+| DEP17 | set_post | `settings.json` | `PostToolUse` |
+| DEP18 | set_stop | `settings.json` | `Stop` present |
+| DEP19 | cfg_json | `hooks/config.json` | exists |
+| DEP20 | cfg_py_key | `config.json` | `pkg_mgrs.python` |
+| DEP21 | cfg_js_key | `config.json` | `pkg_mgrs.js` |
+| DEP22 | timeout_present | `command -v timeout` | present |
+| DEP23 | oxlint_opt | `command -v oxlint` | yes/no |
+| DEP24 | bandit_opt | `command -v bandit` | yes/no |
 
 ## Main Agent Aggregation Logic
 
 After all three agents write their JSONL logs, the main agent:
 
-1. Reads all three JSONL files with `jaq -s '.'`
-2. Counts `pass: true` and `pass: false` records
-3. Lists all failing test names with their `note` field
-4. Applies the D10 teardown policy
-5. Returns a findings report with actionable items for any failures
+0. Verifies all three JSONL files exist and are non-empty
+   (`test -s <file>`). If any file is missing or empty, report
+   which agent failed and treat its tests as unknown failures.
+1. Verifies record counts per agent:
+   - ml-agent: 38 records expected
+   - pm-agent: 28 records expected
+   - dep-agent: 24 records expected
+   If a file has fewer records than expected, report which agent
+   produced a partial run and treat missing tests as unknown
+   failures (the file is still included in aggregation).
+2. Reads all three JSONL files with `jaq -s '.'`
+3. Counts `pass: true` and `pass: false` records
+4. Lists all failing test names with their `note` field
+5. Applies the D10 teardown policy
+6. Returns a findings report with actionable items for any failures
 
 **Aggregation command** (run by main agent after agents complete):
 
 ```bash
 jaq -s '. as $all |
   ($all | map(select(.pass == false)) | length) as $fails |
-  ($all | map(select(.pass == true)) | length) as $pass |
+  ($all | map(select(.pass == true and (.note | test("absent|BIOME_ABSENT") | not))) | length) as $pass |
+  ($all | map(select(.pass == true and (.note | test("absent|BIOME_ABSENT")))) | length) as $skipped |
   {
     passed: $pass,
     failed: $fails,
+    skipped: $skipped,
     failures: (
       $all | map(select(.pass == false)) |
+      map({hook, test_name, note})
+    ),
+    skips: (
+      $all | map(select(.pass == true and (.note | test("absent|BIOME_ABSENT")))) |
       map({hook, test_name, note})
     )
   }' \
@@ -738,7 +897,7 @@ hung test from blocking the entire suite.
 | Layer 1 (stdin/stdout) | 30s | Hooks run Phase 1+2 without subprocess; 30s is generous |
 | Layer 2 (M19 live Edit) | 120s | PostToolUse may spawn subprocess (~25-30s typical) |
 | Layer 2 (P28 live Bash) | 30s | PreToolUse blocks immediately, no subprocess |
-| Suite-level backstop | 15 min | 70 tests × worst case; prevents runaway orchestration |
+| Suite-level backstop | 15 min | 90 tests × worst case; prevents runaway orchestration |
 
 **Timeout mechanism**: Layer 1 tests use `timeout 30 bash
 .claude/hooks/hook.sh`. Layer 2 timeouts are enforced by the
@@ -756,7 +915,7 @@ partial results.
 | Biome absent | Low | High | D4: fail TS tests explicitly |
 | jaq absent | Low | High | DEP01 detects this first |
 | hadolint version < 2.12.0 | Low | Med | DEP09 version check |
-| config.json missing | Low | Med | DEP18 checks existence |
+| config.json missing | Low | Med | DEP19 checks existence |
 | HOOK_SKIP_SUBPROCESS not honored | Low | Med | Self-mitigating: all violation tests use this variable and expect exit 2 — if unhonored, every violation test fails [verify: docs/README.md §Testing Environment Variables] |
 | TeamCreate session orphaned | Low | Low | D10 keep-on-failure policy |
 | JSONL write race condition | Very Low | Low | One file per agent |
@@ -765,9 +924,9 @@ partial results.
 
 **In scope**:
 
-- `multi_linter.sh` functional testing (all file types, M01–M19)
+- `multi_linter.sh` functional testing (all file types, config interactions, language toggles, M01–M38)
 - `enforce_package_managers.sh` functional testing (P01–P28)
-- Dependency presence and version auditing (DEP01–DEP20)
+- Dependency presence and version auditing (DEP01–DEP24)
 - Settings.json registration verification
 - JSONL log production and main agent aggregation
 
@@ -790,7 +949,7 @@ to test:
 | `biome_unsafe_autofix` | `languages.typescript.biome_unsafe_autofix` | **Yes** (2 branch points) | M20 |
 | `oxlint_tsgolint` | `languages.typescript.oxlint_tsgolint` | **Partial** (Biome --skip only) | M21 |
 | `tsgo` | `languages.typescript.tsgo` | **No** (deferred) | M22 (smoke) |
-| `knip` | `languages.typescript.knip` | **No** (deferred) | M22 (smoke) |
+| `knip` | `languages.typescript.knip` | **No** (deferred) | M23 (smoke) |
 | `jscpd.advisory_only` | `jscpd.advisory_only` | **Dead config** | — |
 
 **Dead config finding**: `jscpd.advisory_only` is documented in
@@ -805,7 +964,7 @@ into the code or removed from the config to avoid confusion.
 
 ### Positive
 
-- Structured proof that all hooks work end-to-end (70 test cases)
+- Structured proof that all hooks work end-to-end (90 test cases)
 - Machine-readable JSONL audit trail enables future CI integration
 - Dependency health monitoring catches silent degradation
 - Parallel execution via TeamCreate keeps total runtime manageable
@@ -814,7 +973,7 @@ into the code or removed from the config to avoid confusion.
 
 ### Negative
 
-- Maintenance burden: 70 test cases must be updated when hook
+- Maintenance burden: 90 test cases must be updated when hook
   behavior changes (mitigated by `[verify:]` markers that flag
   which tests depend on which contracts)
 - TeamCreate dependency: test suite requires experimental agent
@@ -834,14 +993,245 @@ into the code or removed from the config to avoid confusion.
 - [ ] Create `.claude/tests/hooks/results/` directory
 - [ ] Implement ml-agent (test cases M01–M19)
 - [ ] Implement pm-agent (test cases P01–P28)
-- [ ] Implement dep-agent (test cases DEP01–DEP20)
+- [ ] Implement dep-agent (test cases DEP01–DEP24)
 - [ ] Implement main agent aggregation and teardown logic
-- [ ] Implement config-toggle tests M20–M22 (separate CLAUDE_PROJECT_DIR per test)
+- [ ] Implement config-toggle tests M20–M23 (separate CLAUDE_PROJECT_DIR per test)
+- [ ] Implement conflict/interaction tests M24–M31 (multi-linter, phase toggles, config combos)
+- [ ] Implement cross-language toggle tests M32–M38 (language disable + unknown extension)
 - [ ] Resolve all `[verify: unresolved]` markers before Accepted
-- [ ] Confirm all 70 test cases produce JSONL records (including
-  live trigger tests with `category: "live_trigger"` and config-toggle
-  tests M20–M22)
+- [ ] Confirm all 90 test cases produce JSONL records (including
+  live trigger tests with `category: "live_trigger"`, config-toggle
+  tests M20–M23, conflict tests M24–M31, and cross-language tests
+  M32–M38)
 - [ ] Confirm teardown/keep behavior per D10
+
+## Acceptance Gates
+
+This ADR moves from **Proposed** to **Accepted** when all of the
+following conditions are met:
+
+1. All `[verify: unresolved]` markers are resolved
+   (`grep '\[verify: unresolved\]'` returns zero matches)
+2. All 90 test cases produce valid JSONL records
+3. The aggregation command runs without errors on the produced JSONL
+4. The dep-agent pre-flight passes (DEP01–DEP04 all present)
+5. The Implementation Checklist above is fully checked off
+6. At least one clean run (all non-skipped tests pass) has been
+   completed and its JSONL logs are available for review
+
+## Orchestrator Playbook
+
+This section provides the execution sequence for the orchestrator
+agent that runs the test suite. The orchestrator is the main agent
+that creates the team, assigns tasks, and aggregates results.
+
+### Prerequisites
+
+- `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` environment variable set
+  (required for TeamCreate)
+- All hook scripts present in `.claude/hooks/`
+- `.claude/settings.json` with hook registrations
+- Test-required tools installed (see Phase 0 setup): biome, oxlint,
+  bandit, timeout
+
+### Phase 0: Setup
+
+```bash
+mkdir -p .claude/tests/hooks/results/
+echo '*.jsonl' > .claude/tests/hooks/results/.gitignore
+```
+
+**Test environment setup**: The dep-agent (Phase 1) verifies all
+tool dependencies, but installing missing tools upfront avoids
+mid-run failures. The following tools are needed for full test
+coverage:
+
+```bash
+# Required* — biome (M15–M18, M26, M28, M30)
+command -v biome || bun add --dev @biomejs/biome
+
+# Optional — oxlint (M26 ts_combined_config)
+command -v oxlint || bun add --dev oxlint
+
+# Optional — bandit (M31 py_multi_tool)
+command -v bandit || uv pip install bandit
+
+# Required — timeout (per-test timeout enforcement)
+command -v timeout || command -v gtimeout || brew install coreutils
+```
+
+See dep-agent inventory (DEP01–DEP24) for the full dependency list.
+If any Required tool is missing, dep-agent will abort the run.
+If an Optional tool is missing, tests that gate on it are skipped
+with `pass: true, note: "absent"`.
+
+Create the team via TeamCreate:
+
+| Parameter | Value |
+| --- | --- |
+| Team name | `hook-integration-test` |
+| Description | `Integration testing of plankton hook system` |
+
+### Phase 1: Environment Pre-Flight (dep-agent)
+
+Spawn `dep-agent` as a TeamCreate teammate (subagent_type:
+`general-purpose`). Assign it the dep-agent test inventory
+(DEP01–DEP24).
+
+**dep-agent prompt template**:
+
+> Run the dep-agent test inventory from the hook integration testing
+> ADR (DEP01–DEP24). For each test, write one JSONL record to
+> `.claude/tests/hooks/results/dep-agent-<timestamp>.jsonl` using
+> `jaq -n` (see JSONL write pattern below). After all tests
+> complete, send a message to the orchestrator with the count of
+> pass/fail results and list any failures.
+
+**Wait for dep-agent to complete.** Check results:
+
+- If **any** of DEP01–DEP04 (jaq, ruff, uv, claude) report
+  `pass: false`: **abort** — the test infrastructure cannot
+  function. Report failures and call TeamDelete.
+- If DEP11 (biome) reports `pass: false`: **continue** — ml-agent
+  will fail M15–M18 per D4, which is the intended behavior.
+  Log the warning.
+- Otherwise: proceed to Phase 2.
+
+### Phase 2: Parallel Testing (ml-agent + pm-agent)
+
+Spawn both agents as TeamCreate teammates (subagent_type:
+`general-purpose`):
+
+**ml-agent prompt template**:
+
+> Run the ml-agent test inventory from the hook integration testing
+> ADR (M01–M38). For each test: create a temp fixture, invoke the
+> hook via stdin pipe, capture exit code and output, write one JSONL
+> record to `.claude/tests/hooks/results/ml-agent-<timestamp>.jsonl`.
+> Use `HOOK_SKIP_SUBPROCESS=1` for all violation tests. Use
+> `CLAUDE_PROJECT_DIR` overrides for TypeScript, config-toggle,
+> conflict, and cross-language tests (M15–M18, M20–M38). For M19
+> (live trigger), use the Edit tool on a temp file and observe the
+> PostToolUse result. After all tests complete, send a message to
+> the orchestrator with results.
+
+**pm-agent prompt template**:
+
+> Run the pm-agent test inventory from the hook integration testing
+> ADR (P01–P28). For each test: construct the JSON payload, pipe
+> to enforce_package_managers.sh, capture exit code and stdout/stderr,
+> write one JSONL record to
+> `.claude/tests/hooks/results/pm-agent-<timestamp>.jsonl`. Use
+> `CLAUDE_PROJECT_DIR` overrides for config mode tests (P25–P27).
+> For P28 (live trigger), use the Bash tool with `pip install` and
+> observe the PreToolUse result. After all tests complete, send a
+> message to the orchestrator with results.
+
+**Wait for both agents to complete.**
+
+### Phase 3: Aggregation
+
+After all agents complete, run the aggregation command (see Main
+Agent Aggregation Logic section). Apply D10 teardown policy based
+on results.
+
+**Backstop enforcement**: The orchestrator tracks wall time from
+team creation using file-based `date +%s` timestamps. At team
+creation, the orchestrator writes the start timestamp:
+
+```bash
+date +%s > .claude/tests/hooks/results/.start_ts
+```
+
+At each checkpoint (agent idle notification, task completion),
+the orchestrator reads this value back and computes elapsed time:
+
+```bash
+start=$(cat .claude/tests/hooks/results/.start_ts)
+elapsed=$(( $(date +%s) - start ))
+```
+
+If `elapsed > 900` (15 minutes), the orchestrator sends
+`shutdown_request` to all active agents, collects whatever JSONL
+has been written, and runs the aggregation on partial results.
+This prevents runaway orchestration.
+
+**Note**: `SECONDS` (used in the JSONL write pattern for per-test
+timing) works correctly within a single Bash tool call but does
+NOT persist across separate Bash tool invocations — each call
+starts a new shell process. The backstop uses file-based `date +%s`
+instead for cross-invocation tracking.
+
+### JSONL Write Pattern
+
+All agents use `jaq -n` with `--arg` for safe JSON construction:
+
+```bash
+# Set once at agent start (substitute agent name):
+LOGFILE=".claude/tests/hooks/results/ml-agent-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
+
+# Per-test timing:
+SECONDS=0
+# ... run the test ...
+jaq -n \
+  --arg hook "multi_linter.sh" \
+  --arg test_name "python_clean" \
+  --arg category "clean" \
+  --arg input_summary "Clean .py file" \
+  --arg expected_decision "exit_0" \
+  --argjson expected_exit 0 \
+  --arg actual_decision "exit_0" \
+  --argjson actual_exit 0 \
+  --arg actual_output "" \
+  --arg actual_stderr "" \
+  --argjson pass true \
+  --arg note "" \
+  --arg ts "$(date -u +%FT%TZ)" \
+  --argjson dur "$((SECONDS * 1000))" \
+  '{
+    hook: $hook,
+    test_name: $test_name,
+    category: $category,
+    input_summary: $input_summary,
+    expected_decision: $expected_decision,
+    expected_exit: $expected_exit,
+    actual_decision: $actual_decision,
+    actual_exit: $actual_exit,
+    actual_output: $actual_output,
+    actual_stderr: $actual_stderr,
+    pass: $pass,
+    note: $note,
+    timestamp: $ts,
+    duration_ms: $dur
+  }' >> "${LOGFILE}"
+```
+
+Reset `SECONDS=0` before each test to measure per-test wall time.
+`date -u +%FT%TZ` produces ISO 8601 UTC timestamps (e.g.,
+`2026-02-20T14:30:22Z`). `$((SECONDS * 1000))` gives
+second-level granularity in milliseconds — available in
+bash, ksh, and zsh (not POSIX-specified; not available in dash
+or ash).
+
+This guarantees valid JSON with proper escaping of special
+characters in output strings. `--argjson` is used for numeric and
+boolean fields; `--arg` for strings.
+
+### Agent Naming Convention
+
+| Agent | TeamCreate name | JSONL file prefix |
+| --- | --- | --- |
+| Multi-linter tester | `ml-agent` | `ml-agent-` |
+| Package manager tester | `pm-agent` | `pm-agent-` |
+| Dependency auditor | `dep-agent` | `dep-agent-` |
+
+### Completion Detection
+
+The orchestrator detects agent completion via TeamCreate's built-in
+idle notification mechanism. When a teammate completes its test
+inventory and sends a results message, it goes idle. The
+orchestrator receives the message and can check TaskList for
+remaining work.
 
 ---
 
@@ -864,3 +1254,8 @@ into the code or removed from the config to avoid confusion.
 - [jaq GitHub repository (jq alternative used in aggregation)](https://github.com/01mf02/jaq)
 - [jq 1.8 Manual (current)](https://jqlang.org/manual/)
 - [hadolint DL3007 rule source](https://github.com/hadolint/hadolint/blob/master/src/Hadolint/Rule/DL3007.hs)
+- [Wooledge Bashism wiki (SECONDS not POSIX)](https://mywiki.wooledge.org/Bashism)
+- [POSIX Shell Command Language specification](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html)
+- [Ruff F841 unused-variable rule](https://docs.astral.sh/ruff/rules/unused-variable/)
+- [ShellCheck SC2086 wiki](https://www.shellcheck.net/wiki/SC2086)
+- [Claude Code Agent Teams documentation](https://code.claude.com/docs/en/agent-teams)
