@@ -166,4 +166,4 @@ Contributions are welcome.
 
 ## license
 
-[Choose your license]
+MIT
