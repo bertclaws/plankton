@@ -10,7 +10,7 @@
     "dockerfile": true,
     "markdown": true,
     "typescript": {
-      "enabled": false,
+      "enabled": true,
       "js_runtime": "auto",
       "biome_nursery": "warn",
       "biome_unsafe_autofix": false,
@@ -64,5 +64,17 @@
       "lib/"
     ],
     "advisory_only": true
+  },
+  "package_managers": {
+    "python": "uv",
+    "javascript": "bun",
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
   }
 }

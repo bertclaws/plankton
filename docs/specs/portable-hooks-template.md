@@ -79,11 +79,11 @@ cc-hooks-template/
 
 ### Phase 1: Core Hook Scripts
 
-**Step 1.1: Copy hook scripts from Incide**
+#### Step 1.1: Copy hook scripts from Incide
 
 Source files:
 
-- `.claude/hooks/multi_linter.sh` (PostToolUse, ~850 lines) - needs config.json integration
+- `.claude/hooks/multi_linter.sh` (PostToolUse) - needs config.json integration
 - `.claude/hooks/protect_linter_configs.sh` (PreToolUse) - needs config.json integration
 - `.claude/hooks/stop_config_guardian.sh` (Stop hook) - needs config.json integration
 - `.claude/hooks/approve_configs.sh` (helper) - copy as-is, no changes needed
@@ -461,10 +461,11 @@ config.json and this list.
 
 ### Phase 4: Linter Configuration Files
 
-**Step 4.1: Copy opinionated defaults from Incide**
+#### Step 4.1: Copy opinionated defaults from Incide
 
 All 10 linter config files copied with these modifications:
 
+<!-- markdownlint-disable MD013 -->
 | File | Changes from Incide | Rationale |
 | ---- | ------------------- | --------- |
 | `.ruff.toml` | Remove per-file-ignores for `src/app/data_models.py` | Incide-specific Gemini API constraint |
@@ -479,6 +480,7 @@ All 10 linter config files copied with these modifications:
 | `.markdownlint-cli2.jsonc` | Remove Incide-specific globs if any | Clean slate |
 | `.jscpd.json` | Update `path` entries to `["src/", "lib/"]` | Generic, not `webapp/evaluation/` |
 | `taplo.toml` | Copy as-is | Already generic |
+<!-- markdownlint-enable MD013 -->
 
 **Step 4.2: Create `vulture_whitelist.py`**
 
@@ -671,7 +673,7 @@ definitions, execution order, and `repo: local` pattern.
 
 ### Phase 6: Project Skeleton
 
-**Step 6.1: Python project structure**
+#### Step 6.1: Python project structure
 
 ```text
 src/
@@ -823,6 +825,7 @@ docker-compose.override.yml
 
 Standard development targets:
 
+<!-- markdownlint-disable MD010 -->
 ```makefile
 .PHONY: install lint test format install-hooks clean
 
@@ -848,6 +851,7 @@ clean:
 	find . -type d -name .pytest_cache -exec rm -rf {} +
 	rm -rf dist build *.egg-info
 ```
+<!-- markdownlint-enable MD010 -->
 
 ### Phase 7: Documentation
 
@@ -963,8 +967,9 @@ Copy from Incide with these changes:
 
 ## 6. What Changes from Incide (Behavioral Differences)
 
-### In the Template (vs Incide):
+### In the Template (vs Incide)
 
+<!-- markdownlint-disable MD013 -->
 | Aspect | Incide | Template |
 | ------ | ------ | -------- |
 | Settings file | `settings.json` with ~90 permissions + absolute paths | `settings.json` with relative paths, empty permissions |
@@ -981,8 +986,9 @@ Copy from Incide with these changes:
 | Pre-commit | 13 hooks with Incide paths | 13 hooks with generic paths |
 | Settings paths | Absolute: `/Users/alex/.../incide/...` | Relative: `.claude/hooks/...` |
 | Project skeleton | N/A (existing project) | Full starter: src/app/, tests/, Dockerfile, CI, Makefile |
+<!-- markdownlint-enable MD013 -->
 
-### Behavioral Changes in New Projects:
+### Behavioral Changes in New Projects
 
 1. **Clean slate**: No pre-existing violations. Hooks enforce from day one
 2. **No Gemini API workarounds**: `.flake8` PYD001 exclusion for
@@ -996,7 +1002,7 @@ Copy from Incide with these changes:
 
 ## 7. Dependencies (What Must Be Installed)
 
-### Required (hook scripts fail without these):
+### Required (hook scripts fail without these)
 
 | Tool | Purpose | Install |
 | ---- | ------- | ------- |
@@ -1005,8 +1011,9 @@ Copy from Incide with these changes:
 | `claude` | Claude Code CLI (subprocess delegation) | npm install |
 | `uv` | Python package manager | `pip install uv` |
 
-### Optional (gracefully skipped if missing):
+### Optional (gracefully skipped if missing)
 
+<!-- markdownlint-disable MD013 -->
 | Tool | Purpose | Install |
 | ---- | ------- | ------- |
 | `ty` | Python type checking | `uv add --dev ty` |
@@ -1022,6 +1029,7 @@ Copy from Incide with these changes:
 | `markdownlint-cli2` | Markdown linting | `npm install -g markdownlint-cli2` |
 | `jscpd` | Duplicate code detection | via `npx` (no install needed) |
 | `actionlint` | GitHub Actions linting | `brew install actionlint` |
+<!-- markdownlint-enable MD013 -->
 
 ## 8. Verification
 

@@ -6,35 +6,35 @@ automated code quality enforcement. The hook scripts live in `.claude/hooks/`.
 ## Architecture
 
 ```text
-PreToolUse (Edit/Write)     PostToolUse (Edit/Write)           Stop (session end)
-         |                           |                                |
-         v                           v                                v
-protect_linter_configs.sh   multi_linter.sh       stop_config_guardian.sh
-         |                    (Three Phases)          (Command Hook)
-         v                         |                       |
-   File protected?       +---------+---------+             v
-    +- YES -> Block      |         |         |       Detects config
-    +- NO -> Allow   Phase 1   Phase 2   Phase 3     changes via
-                      Auto-fmt  Collect   Delegate    git diff
-                      (silent)  (JSON)    + Verify         |
-                                              {decision: approve/block}
-                          |         |         |
-                          v         v         v
-                       Format   violations  claude -p
-                       applied  as JSON     subprocess
-                                    |         |
-                                    +----+----+
-                                         v
-                                   Verify: rerun
-                                   Phase 1 + 2
-                                         |
-                                    +----+----+
-                                    |         |
-                                 count=0   count>0
-                                    |         |
-                                    v         v
-                                 exit 0    exit 2
-                                (silent)  (report)
+PreToolUse (Edit/Write)   PreToolUse (Bash)         PostToolUse (Edit/Write)   Stop (session end)
+         |                        |                           |                       |
+         v                        v                           v                       v
+protect_linter_configs.sh  enforce_package_managers.sh  multi_linter.sh  stop_config_guardian.sh
+         |                        |                      (Three Phases)     (Command Hook)
+         v                        v                           |                   |
+   File protected?        Cmd uses legacy PM?      +---------+---------+          v
+    +- YES -> Block        +- YES -> Block         |         |         |    Detects config
+    +- NO -> Allow         +- NO  -> Allow     Phase 1   Phase 2   Phase 3  changes via
+                                                Auto-fmt  Collect   Delegate  git diff
+                                                (silent)  (JSON)    + Verify
+                                                                {decision: approve/block}
+                                                    |         |         |
+                                                    v         v         v
+                                                 Format   violations  claude -p
+                                                 applied  as JSON     subprocess
+                                                              |         |
+                                                              +----+----+
+                                                                   v
+                                                             Verify: rerun
+                                                             Phase 1 + 2
+                                                                   |
+                                                              +----+----+
+                                                              |         |
+                                                           count=0   count>0
+                                                              |         |
+                                                              v         v
+                                                           exit 0    exit 2
+                                                          (silent)  (report)
 ```
 
 ## Message Flow During Execution
@@ -209,6 +209,7 @@ All hook messages use `[hook:]` prefix with severity:
 
 | Prefix | Meaning | Exit Code |
 | --- | --- | --- |
+| `[hook:block]` | PreToolUse block — command blocked, replacement shown | 0 |
 | `[hook:error]` | Fatal error, cannot proceed | 2 |
 | `[hook:warning]` | Non-fatal issue, continues | 0 or 2 |
 | `[hook:advisory]` | Informational only | 0 |
@@ -689,6 +690,7 @@ many issues silently:
 | --- | --- |
 | `multi_linter.sh` | PostToolUse hook - lints edited files |
 | `protect_linter_configs.sh` | PreToolUse hook - blocks config & hook edits |
+| `enforce_package_managers.sh` | PreToolUse - blocks legacy package managers |
 | `stop_config_guardian.sh` | Stop hook - detects config changes |
 | `approve_configs.sh` | Helper - creates guard file for stop hook |
 | `test_hook.sh` | Debug utility with `--self-test` suite |
@@ -886,6 +888,9 @@ If the file is missing, all features are enabled with sensible defaults.
 | `jscpd.session_threshold` | number | 3 | Files modified before jscpd runs |
 | `jscpd.scan_dirs` | str[] | ["src/","lib/"] | Dirs to scan for dupes |
 | `jscpd.advisory_only` | bool | true | Report-only mode (no blocking) |
+| `package_managers.python` | str\|false | "uv" | Python PM: uv/uv:warn/off |
+| `package_managers.javascript` | str\|false | "bun" | JS PM: bun/bun:warn/off |
+| `…allowed_subcommands.<tool>` | str[] | (varies) | Exempt subcommands |
 
 ### Example: Disable Markdown Linting
 
@@ -901,6 +906,47 @@ Environment variables override config.json values:
 
 - `HOOK_SUBPROCESS_TIMEOUT` overrides `subprocess.timeout`
 - `HOOK_SKIP_SUBPROCESS=1` disables subprocess regardless of config
+
+### Package Manager Enforcement
+
+The `package_managers` section configures `enforce_package_managers.sh`, which
+intercepts legacy package manager commands in Claude's Bash tool before execution.
+
+**Three enforcement modes** (per ecosystem):
+
+| Value | Behavior |
+| --- | --- |
+| `"uv"` / `"bun"` | Block command, suggest replacement |
+| `"uv:warn"` / `"bun:warn"` | Allow command, emit `[hook:advisory]` to stderr |
+| `false` | Enforcement disabled for this ecosystem |
+
+**Disable Python enforcement:**
+
+```json
+{
+  "package_managers": {
+    "python": false
+  }
+}
+```
+
+**Enable warn mode for migration:**
+
+```json
+{
+  "package_managers": {
+    "python": "uv:warn",
+    "javascript": "bun:warn"
+  }
+}
+```
+
+**Environment variable overrides:**
+
+- `HOOK_SKIP_PM=1` — bypass all package manager enforcement for the session
+  (`HOOK_SKIP_PM=1 claude ...`)
+- `HOOK_DEBUG_PM=1` — log matching decisions to stderr for troubleshooting
+- `HOOK_LOG_PM=1` — log all decisions to `/tmp/.pm_enforcement_<pid>.log`
 
 ## Defense in Depth: Prevention + Recovery
 

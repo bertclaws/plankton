@@ -18,7 +18,7 @@ run_self_test() {
   local failed=0
   local temp_dir
   temp_dir=$(mktemp -d)
-  trap 'rm -rf "${temp_dir}"; rm -f /tmp/.biome_path_$$ /tmp/.semgrep_session_$$ /tmp/.semgrep_session_$$.done /tmp/.jscpd_ts_session_$$ /tmp/.jscpd_session_$$ /tmp/.sfc_warned_*_$$ /tmp/.nursery_checked_$$' EXIT
+  trap 'rm -rf "${temp_dir}"; rm -f /tmp/.biome_path_$$ /tmp/.semgrep_session_$$ /tmp/.semgrep_session_$$.done /tmp/.jscpd_ts_session_$$ /tmp/.jscpd_session_$$ /tmp/.sfc_warned_*_$$ /tmp/.nursery_checked_$$ /tmp/.pm_warn_*_$$ /tmp/.pm_test_stderr_$$ /tmp/.pm_enforcement_$$.log' EXIT
 
   echo "=== Hook Self-Test Suite ==="
   echo ""
@@ -47,26 +47,59 @@ run_self_test() {
     fi
   }
 
-  # Test helper for existing files (does NOT modify file)
-  # Uses HOOK_SKIP_SUBPROCESS=1 to test detection without subprocess fixing
-  test_existing_file() {
-    local name="$1"
-    local file="$2"
-    local expect_exit="$3"
+  # Test helper for package manager hook (enforce_package_managers.sh)
+  # Sends a Bash tool_input.command JSON to the PM hook and checks the decision.
+  test_bash_command() {
+    local name="$1"           # Test name
+    local command_str="$2"    # Command to test
+    local expected="$3"       # "approve" or "block"
+    local pm_dir="$4"         # CLAUDE_PROJECT_DIR override (temp dir with config)
+    local extra_check="${5:-}" # Optional: string to grep in stdout+stderr
 
-    local json_input='{"tool_input": {"file_path": "'"${file}"'"}}'
+    local json_input="{\"tool_name\": \"Bash\", \"tool_input\": {\"command\": \"${command_str}\"}}"
     set +e
-    echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 "${script_dir}/multi_linter.sh" >/dev/null 2>&1
+    local output stderr_output
+    output=$(echo "${json_input}" | CLAUDE_PROJECT_DIR="${pm_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/tmp/.pm_test_stderr_$$)
     local actual_exit=$?
+    stderr_output=$(cat /tmp/.pm_test_stderr_$$ 2>/dev/null || true)
+    rm -f /tmp/.pm_test_stderr_$$
     set -e
 
-    if [[ "${actual_exit}" -eq "${expect_exit}" ]]; then
-      echo "PASS ${name}: exit ${actual_exit} (expected ${expect_exit})"
+    local decision
+    decision=$(echo "${output}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+
+    local pass=true
+    [[ "${decision}" != "${expected}" ]] && pass=false
+    if [[ -n "${extra_check}" ]]; then
+      echo "${output}${stderr_output}" | grep -qF "${extra_check}" || pass=false
+    fi
+
+    if "${pass}"; then
+      echo "PASS ${name}: decision=${decision}"
       passed=$((passed + 1))
     else
-      echo "FAIL ${name}: exit ${actual_exit} (expected ${expect_exit})"
+      echo "FAIL ${name}: decision=${decision} (expected ${expected})"
+      [[ -n "${extra_check}" ]] && echo "   extra_check='${extra_check}' not found"
+      echo "   stdout: ${output}"
+      echo "   stderr: ${stderr_output}"
       failed=$((failed + 1))
     fi
+  }
+
+  # _create_mock_path_without(exclude_tool, mock_dir)
+  # Creates mock_dir with symlinks to all tools used by the hook scripts,
+  # EXCLUDING the specified tool. Used for "tool not installed" tests.
+  _create_mock_path_without() {
+    local exclude_tool="$1"
+    local mock_dir="$2"
+    mkdir -p "${mock_dir}"
+    local t t_path
+    for t in jaq grep sed tr head cat touch bash; do
+      [[ "${t}" == "${exclude_tool}" ]] && continue
+      t_path=$(command -v "${t}" 2>/dev/null || true)
+      [[ -n "${t_path}" ]] && ln -sf "${t_path}" "${mock_dir}/${t}" 2>/dev/null || true
+    done
   }
 
   # Dockerfile pattern tests
@@ -624,6 +657,379 @@ console.log(x);'
   echo "[skip] #19 oxlint: timeout gate (deferred)"
   echo "[skip] #20 tsgo: session advisory (deferred)"
   echo "[skip] #21 tsgo: disabled default (deferred)"
+
+  # ============================================================
+  # Package Manager Enforcement Tests
+  # ============================================================
+  echo ""
+  echo "--- Package Manager Enforcement Tests ---"
+
+  # Create test config directories
+  pm_project_dir="${temp_dir}/pm_project"
+  pm_warn_py_dir="${temp_dir}/pm_warn_py"
+  pm_warn_js_dir="${temp_dir}/pm_warn_js"
+  pm_off_py_dir="${temp_dir}/pm_off_py"
+  pm_off_js_dir="${temp_dir}/pm_off_js"
+
+  for d in "${pm_project_dir}" "${pm_warn_py_dir}" "${pm_warn_js_dir}" \
+            "${pm_off_py_dir}" "${pm_off_js_dir}"; do
+    mkdir -p "${d}/.claude/hooks"
+  done
+
+  # Default: both ecosystems block mode
+  cat > "${pm_project_dir}/.claude/hooks/config.json" << 'PM_CFG_EOF'
+{
+  "package_managers": {
+    "python": "uv",
+    "javascript": "bun",
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
+  }
+}
+PM_CFG_EOF
+
+  # python: warn, JS: block
+  cat > "${pm_warn_py_dir}/.claude/hooks/config.json" << 'PM_WARN_PY_EOF'
+{
+  "package_managers": {
+    "python": "uv:warn",
+    "javascript": "bun",
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
+  }
+}
+PM_WARN_PY_EOF
+
+  # python: block, JS: warn
+  cat > "${pm_warn_js_dir}/.claude/hooks/config.json" << 'PM_WARN_JS_EOF'
+{
+  "package_managers": {
+    "python": "uv",
+    "javascript": "bun:warn",
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
+  }
+}
+PM_WARN_JS_EOF
+
+  # python: disabled, JS: block
+  cat > "${pm_off_py_dir}/.claude/hooks/config.json" << 'PM_OFF_PY_EOF'
+{
+  "package_managers": {
+    "python": false,
+    "javascript": "bun",
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
+  }
+}
+PM_OFF_PY_EOF
+
+  # python: block, JS: disabled
+  cat > "${pm_off_js_dir}/.claude/hooks/config.json" << 'PM_OFF_JS_EOF'
+{
+  "package_managers": {
+    "python": "uv",
+    "javascript": false,
+    "allowed_subcommands": {
+      "npm": ["audit", "view", "pack", "publish", "whoami", "login"],
+      "pip": ["download"],
+      "yarn": ["audit", "info"],
+      "pnpm": ["audit", "info"],
+      "poetry": [],
+      "pipenv": []
+    }
+  }
+}
+PM_OFF_JS_EOF
+
+  # --- Python Tests (block mode) ---
+  echo ""
+  echo "--- Python Tests (block mode) ---"
+  test_bash_command "pip install blocked" \
+    "pip install requests" "block" "${pm_project_dir}" "uv add requests"
+  test_bash_command "pip3 blocked" \
+    "pip3 install flask" "block" "${pm_project_dir}"
+  test_bash_command "python -m pip blocked" \
+    "python -m pip install pkg" "block" "${pm_project_dir}"
+  test_bash_command "python3 -m pip blocked" \
+    "python3 -m pip install pkg" "block" "${pm_project_dir}"
+  test_bash_command "python -m venv blocked" \
+    "python -m venv .venv" "block" "${pm_project_dir}" "uv venv"
+  test_bash_command "poetry blocked" \
+    "poetry add requests" "block" "${pm_project_dir}"
+  test_bash_command "pipenv blocked" \
+    "pipenv install" "block" "${pm_project_dir}"
+  test_bash_command "uv pip passthrough" \
+    "uv pip install -r req.txt" "approve" "${pm_project_dir}"
+  test_bash_command "uv add passthrough" \
+    "uv add requests" "approve" "${pm_project_dir}"
+  test_bash_command "pip freeze blocked" \
+    "pip freeze" "block" "${pm_project_dir}" "uv pip freeze"
+  test_bash_command "pip list blocked" \
+    "pip list" "block" "${pm_project_dir}" "uv pip list"
+  test_bash_command "pip editable blocked" \
+    "pip install -e ." "block" "${pm_project_dir}" "uv pip install -e ."
+  test_bash_command "pip download allowed" \
+    "pip download requests" "approve" "${pm_project_dir}"
+  test_bash_command "bare pip blocked" \
+    "pip" "block" "${pm_project_dir}"
+  test_bash_command "bare poetry blocked" \
+    "poetry" "block" "${pm_project_dir}"
+  test_bash_command "poetry show blocked" \
+    "poetry show" "block" "${pm_project_dir}"
+  test_bash_command "poetry env blocked" \
+    "poetry env use 3.11" "block" "${pm_project_dir}"
+  test_bash_command "pipenv graph blocked" \
+    "pipenv graph" "block" "${pm_project_dir}"
+  test_bash_command "compound pip" \
+    "cd /app && pip install flask" "block" "${pm_project_dir}"
+  test_bash_command "pip diagnostic" \
+    "pip --version" "approve" "${pm_project_dir}"
+  test_bash_command "poetry diagnostic" \
+    "poetry --help" "approve" "${pm_project_dir}"
+
+  # --- JavaScript Tests (block mode) ---
+  echo ""
+  echo "--- JavaScript Tests (block mode) ---"
+  test_bash_command "npm install blocked" \
+    "npm install lodash" "block" "${pm_project_dir}" "bun add lodash"
+  test_bash_command "npm run blocked" \
+    "npm run build" "block" "${pm_project_dir}" "bun run build"
+  test_bash_command "npm test blocked" \
+    "npm test" "block" "${pm_project_dir}" "bun test"
+  test_bash_command "npx blocked" \
+    "npx create-react-app" "block" "${pm_project_dir}" "bunx create-react-app"
+  test_bash_command "yarn blocked" \
+    "yarn add lodash" "block" "${pm_project_dir}"
+  test_bash_command "pnpm blocked" \
+    "pnpm install" "block" "${pm_project_dir}"
+  test_bash_command "npm audit allowed" \
+    "npm audit" "approve" "${pm_project_dir}"
+  test_bash_command "npm view allowed" \
+    "npm view lodash" "approve" "${pm_project_dir}"
+  test_bash_command "compound npm" \
+    "npm install && npm run build" "block" "${pm_project_dir}"
+  test_bash_command "bun passthrough" \
+    "bun add lodash" "approve" "${pm_project_dir}"
+  test_bash_command "bunx passthrough" \
+    "bunx vite" "approve" "${pm_project_dir}"
+  test_bash_command "bare yarn blocked" \
+    "yarn" "block" "${pm_project_dir}"
+  test_bash_command "bare pnpm blocked" \
+    "pnpm" "block" "${pm_project_dir}"
+  test_bash_command "yarn audit allowed" \
+    "yarn audit" "approve" "${pm_project_dir}"
+  test_bash_command "pnpm audit allowed" \
+    "pnpm audit" "approve" "${pm_project_dir}"
+  test_bash_command "pnpm info allowed" \
+    "pnpm info lodash" "approve" "${pm_project_dir}"
+  test_bash_command "npm -g install blocked" \
+    "npm -g install foo" "block" "${pm_project_dir}"
+  test_bash_command "npm --registry flag+allowlist" \
+    "npm --registry=url audit" "approve" "${pm_project_dir}"
+  test_bash_command "bare npm blocked" \
+    "npm" "block" "${pm_project_dir}"
+  test_bash_command "npm diagnostic" \
+    "npm --version" "approve" "${pm_project_dir}"
+  test_bash_command "cross-ecosystem compound" \
+    "pip install && npm install" "block" "${pm_project_dir}"
+  test_bash_command "npm+yarn compound" \
+    "npm audit && yarn add lodash" "block" "${pm_project_dir}"
+
+  # --- Config toggle tests ---
+  echo ""
+  echo "--- Config Toggle Tests ---"
+  test_bash_command "python disabled" \
+    "pip install requests" "approve" "${pm_off_py_dir}"
+  test_bash_command "javascript disabled" \
+    "npm install" "approve" "${pm_off_js_dir}"
+
+  # --- Warn mode tests ---
+  echo ""
+  echo "--- Warn Mode Tests ---"
+  test_bash_command "pip warn mode" \
+    "pip install flask" "approve" "${pm_warn_py_dir}" "[hook:advisory]"
+  test_bash_command "npm warn mode" \
+    "npm install" "approve" "${pm_warn_js_dir}" "[hook:advisory]"
+  test_bash_command "warn + allowlist" \
+    "npm audit" "approve" "${pm_warn_js_dir}"
+  test_bash_command "warn + diagnostic" \
+    "pip --version" "approve" "${pm_warn_py_dir}"
+  test_bash_command "compound warn" \
+    "cd /app && pip install requests" "approve" "${pm_warn_py_dir}" "[hook:advisory]"
+  test_bash_command "warn msg format" \
+    "pip install flask" "approve" "${pm_warn_py_dir}" "uv add flask"
+
+  # --- HOOK_SKIP_PM bypass ---
+  echo ""
+  echo "--- Bypass and Passthrough Tests ---"
+  local skip_output
+  skip_output=$(echo '{"tool_name": "Bash", "tool_input": {"command": "pip install requests"}}' \
+    | HOOK_SKIP_PM=1 CLAUDE_PROJECT_DIR="${pm_project_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/dev/null || true)
+  local skip_decision
+  skip_decision=$(echo "${skip_output}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if [[ "${skip_decision}" == "approve" ]]; then
+    echo "PASS HOOK_SKIP_PM bypass: decision=approve"
+    passed=$((passed + 1))
+  else
+    echo "FAIL HOOK_SKIP_PM bypass: decision=${skip_decision} (expected approve)"
+    failed=$((failed + 1))
+  fi
+
+  # --- Non-package command ---
+  test_bash_command "non-package cmd" \
+    "ls -la" "approve" "${pm_project_dir}"
+
+  # --- jaq missing (fail-open) ---
+  # Mock PATH without jaq to test fail-open behavior
+  local mock_tools_dir="${temp_dir}/mock_tools_nojaq"
+  mkdir -p "${mock_tools_dir}"
+  # Create stub PATH that has everything except jaq
+  local nojaq_output
+  set +e
+  nojaq_output=$(echo '{"tool_name": "Bash", "tool_input": {"command": "pip install requests"}}' \
+    | PATH="${mock_tools_dir}" CLAUDE_PROJECT_DIR="${pm_project_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/dev/null || echo '{"decision": "approve"}')
+  set -e
+  local nojaq_decision
+  nojaq_decision=$(echo "${nojaq_output}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if [[ "${nojaq_decision}" == "approve" ]]; then
+    echo "PASS jaq missing (fail-open): decision=approve"
+    passed=$((passed + 1))
+  else
+    echo "FAIL jaq missing (fail-open): decision=${nojaq_decision} (expected approve)"
+    failed=$((failed + 1))
+  fi
+
+  echo ""
+  echo "--- Coverage Completion Tests ---"
+  test_bash_command "python3 -m venv blocked" \
+    "python3 -m venv .venv" "block" "${pm_project_dir}" "uv venv"
+  test_bash_command "bare pipenv blocked" \
+    "pipenv" "block" "${pm_project_dir}"
+
+  echo ""
+  echo "--- Compound Tests ---"
+  # Known limitation: uv pip passthrough approves whole compound command
+  test_bash_command "uv+pip compound known-limitation" \
+    "uv pip install -r req.txt && pip install flask" "approve" "${pm_project_dir}"
+  # npm --version no-ops; regex finds second npm install in full string
+  test_bash_command "npm diag+install compound" \
+    "npm --version && npm install" "block" "${pm_project_dir}"
+  # pip diag no-ops; independent poetry block catches poetry add (post-restructure)
+  test_bash_command "pip diag+poetry compound" \
+    "pip --version && poetry add requests" "block" "${pm_project_dir}"
+  # same-tool diagnostic: substring matching finds blocked cmd at second position
+  test_bash_command "pipenv diag+install compound" \
+    "pipenv --version && pipenv install" "block" "${pm_project_dir}"
+  # cross-tool: pip diag no-ops in elif chain; independent pipenv block
+  # catches pipenv install in the same full string scan
+  test_bash_command "pip diag+pipenv compound" \
+    "pip --version && pipenv install" "block" "${pm_project_dir}"
+  # same-tool: first if-branch finds poetry add (second occurrence);
+  # --help fails [a-zA-Z]+ so diagnostic elif is never entered
+  test_bash_command "poetry diag+add compound" \
+    "poetry --help && poetry add requests" "block" "${pm_project_dir}"
+
+  echo ""
+  echo "--- Pip Download Variant ---"
+  test_bash_command "pip download -d allowed" \
+    "pip download -d ./dist requests" "approve" "${pm_project_dir}"
+
+  echo ""
+  echo "--- Tool Missing Warning Tests ---"
+  local mock_nouv="${temp_dir}/mock_nouv"
+  local mock_nobun="${temp_dir}/mock_nobun"
+  _create_mock_path_without "uv" "${mock_nouv}"
+  _create_mock_path_without "bun" "${mock_nobun}"
+
+  # uv missing: pip install should block AND emit [hook:warning] about uv
+  set +e
+  local nouv_out nouv_err
+  nouv_out=$(echo '{"tool_name":"Bash","tool_input":{"command":"pip install requests"}}' \
+    | PATH="${mock_nouv}" CLAUDE_PROJECT_DIR="${pm_project_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/tmp/.pm_test_stderr_$$)
+  nouv_err=$(cat /tmp/.pm_test_stderr_$$ 2>/dev/null || true)
+  rm -f /tmp/.pm_test_stderr_$$
+  set -e
+  local nouv_dec
+  nouv_dec=$(echo "${nouv_out}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if [[ "${nouv_dec}" == "block" ]] && echo "${nouv_err}" | grep -qF "[hook:warning]"; then
+    echo "PASS uv missing warning: decision=block, warning emitted"
+    passed=$((passed + 1))
+  else
+    echo "FAIL uv missing warning: decision=${nouv_dec}, stderr=${nouv_err}"
+    failed=$((failed + 1))
+  fi
+
+  # bun missing: npm install should block AND emit [hook:warning] about bun
+  set +e
+  local nobun_out nobun_err
+  nobun_out=$(echo '{"tool_name":"Bash","tool_input":{"command":"npm install lodash"}}' \
+    | PATH="${mock_nobun}" CLAUDE_PROJECT_DIR="${pm_project_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/tmp/.pm_test_stderr_$$)
+  nobun_err=$(cat /tmp/.pm_test_stderr_$$ 2>/dev/null || true)
+  rm -f /tmp/.pm_test_stderr_$$
+  set -e
+  local nobun_dec
+  nobun_dec=$(echo "${nobun_out}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if [[ "${nobun_dec}" == "block" ]] && echo "${nobun_err}" | grep -qF "[hook:warning]"; then
+    echo "PASS bun missing warning: decision=block, warning emitted"
+    passed=$((passed + 1))
+  else
+    echo "FAIL bun missing warning: decision=${nobun_dec}, stderr=${nobun_err}"
+    failed=$((failed + 1))
+  fi
+
+  echo ""
+  echo "--- Debug Mode Test ---"
+  set +e
+  local dbg_out dbg_err
+  dbg_out=$(echo '{"tool_name":"Bash","tool_input":{"command":"pip install requests"}}' \
+    | HOOK_DEBUG_PM=1 CLAUDE_PROJECT_DIR="${pm_project_dir}" \
+      "${script_dir}/enforce_package_managers.sh" 2>/tmp/.pm_test_stderr_$$)
+  dbg_err=$(cat /tmp/.pm_test_stderr_$$ 2>/dev/null || true)
+  rm -f /tmp/.pm_test_stderr_$$
+  set -e
+  local dbg_dec
+  dbg_dec=$(echo "${dbg_out}" | jaq -r '.decision // "none"' 2>/dev/null || echo "none")
+  if [[ "${dbg_dec}" == "block" ]] && echo "${dbg_err}" | grep -qF "[hook:debug]"; then
+    echo "PASS HOOK_DEBUG_PM: decision=block, debug line emitted"
+    passed=$((passed + 1))
+  else
+    echo "FAIL HOOK_DEBUG_PM: decision=${dbg_dec}, stderr=${dbg_err}"
+    failed=$((failed + 1))
+  fi
+
+  echo ""
+  echo "--- Yarn Info Allowed ---"
+  test_bash_command "yarn info allowed" \
+    "yarn info lodash" "approve" "${pm_project_dir}"
 
   # Summary
   echo ""

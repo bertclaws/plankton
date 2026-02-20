@@ -293,11 +293,13 @@ positives in these edge cases:
   a string literal
 - Variable assignments: `PKG_MGR=pip` — blocked (false positive: the
   bare pip regex matches `pip` after `=` since `=` is not in `[a-zA-Z0-9_]`)
-- Diagnostic flags in Python compound commands:
-  `pip --version && poetry add requests` — `pip --version` matches the
-  diagnostic carve-out, the elif chain exits, and `poetry add` is not
-  checked. Same category as the `uv pip` compound limitation (the elif
-  chain is one-shot). JS tools are unaffected (independent if blocks).
+- ~~Cross-tool Python diagnostic compound~~ (resolved in 2026-02
+  restructure): `pip --version && poetry add requests` previously
+  approved because the pip diagnostic no-op exited the elif chain
+  before poetry was checked. Poetry and pipenv now use independent
+  if blocks, so cross-tool compounds are caught (including
+  `pip --version && pipenv install`). The `uv pip`
+  passthrough remains (see D7 warn-mode compound behavior).
 
 These are accepted trade-offs. In practice, Claude rarely generates
 commands with package manager names in comments or here-docs. The
@@ -688,7 +690,10 @@ existence checks):
 | npm --version compound | `npm --version && npm install` | block (install) |
 | npm flag+allowlist | `npm --registry=url audit` | approve (flag+allowlisted) |
 | npm -g install | `npm -g install foo` | block (flag+blocked subcmd) |
-| pip diag+poetry compound | `pip --version && poetry add` | approve (elif) |
+| pip diag+poetry compound | `pip --version && poetry add` | block (poetry) |
+| pipenv compound | `pipenv --version && pipenv install` | block (same-tool) |
+| pip+pipenv compound | `pip --version && pipenv install` | block (pipenv) |
+| poetry diag+add compound | `poetry --help && poetry add` | block (poetry) |
 | uv missing warning | `pip install` (uv not in PATH) | block + stderr warning |
 | bun missing warning | `npm install` (bun not in PATH) | block + warning |
 | debug mode output | `pip install` (HOOK_DEBUG_PM=1) | block + stderr debug |
@@ -841,16 +846,17 @@ or:
    b2. Diagnostic flags (--version, -v, -V, --help, -h): no-op
        (elif chain exits, preventing bare-pip block)
    c. Match python -m pip / python -m venv
-   d. Match poetry: extract subcommand, check allowed_subcommands.poetry
-   d2. Poetry diagnostic flags: no-op
-   e. Match pipenv: extract subcommand, check allowed_subcommands.pipenv
-   e2. Pipenv diagnostic flags: no-op
+   d. (independent if block) poetry: extract subcommand, check
+      allowed_subcommands.poetry; diagnostic flags: no-op
+   e. (independent if block) pipenv: extract subcommand, check
+      allowed_subcommands.pipenv; diagnostic flags: no-op
    f. If matched and not allowlisted: call block() or warn() per mode
-   Note: Python uses elif chain (not separate if blocks) because
-   "uv pip" contains substring "pip" — separate blocks would
-   false-positive on uv commands. Diagnostic no-ops inside the
-   elif chain mean `pip --version && poetry add` misses poetry
-   (accepted limitation — see D7).
+   Note: pip/python-m family (a–c) uses elif chain because "uv pip"
+   contains substring "pip". Poetry and pipenv (d, e) use independent
+   if blocks — cross-tool compounds like `pip --version && poetry add
+   requests` ARE caught. The uv pip passthrough calls exit 0
+   immediately, so `uv pip install && pip install` still approves
+   (documented limitation — see D7 warn-mode compound behavior).
 5. If javascript enforcement enabled (value != "false"):
    a0. Parse mode: "bun" → block, "bun:warn" → warn (see parse_pm_config)
    Each JS tool checked independently (separate if blocks, NOT elif):
@@ -884,8 +890,8 @@ bash `=~` on macOS and Linux. PCRE features (lookbehinds, lookaheads,
 Word boundaries use character class alternatives:
 `(^|[^a-zA-Z0-9_])` for start, `([^a-zA-Z0-9_]|$)` for end.
 
-**Python enforcement** — elif chain (required because `uv pip` contains
-substring `pip`; separate if blocks would false-positive on uv commands):
+**Python enforcement** — elif chain for pip/python-m family;
+independent if blocks for poetry/pipenv:
 
 ```bash
 WB_START='(^|[^a-zA-Z0-9_])'
@@ -893,53 +899,72 @@ WB_END='([^a-zA-Z0-9_]|$)'
 
 # py_mode set from parse_pm_config (e.g., "block" or "warn")
 
-# Step 1: Check for uv pip prefix -> passthrough (approve)
+# Block 1: pip/python-m elif chain
+# (elif required — "uv pip" contains "pip"; separate if would
+# false-positive on uv pip install)
 if [[ "${command}" =~ ${WB_START}uv[[:space:]]+pip ]]; then
-  approve  # uv pip install, uv pip freeze, etc.
+  approve  # uv pip passthrough — exit 0, script ends here
 
-# Step 2: pip/pip3 -> extract subcommand, check allowlist
 elif [[ "${command}" =~ ${WB_START}pip3?[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "pip" "${subcmd}" || enforce "${py_mode}" "pip" "${subcmd}"
-elif [[ "${command}" =~ ${WB_START}pip3?[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
-  :  # pip diagnostic — no-op (elif chain exits without blocking)
+  is_allowed_subcommand "pip" "${subcmd}" || \
+    enforce "${py_mode}" "pip" "${subcmd}"
+elif [[ "${command}" =~ \
+    ${WB_START}pip3?[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
+  :  # pip diagnostic — no-op
 elif [[ "${command}" =~ ${WB_START}pip3?${WB_END} ]]; then
   enforce "${py_mode}" "pip"  # bare pip
-
-# Step 3: python -m pip -> enforce
-elif [[ "${command}" =~ ${WB_START}python3?[[:space:]]+-m[[:space:]]+pip${WB_END} ]]; then
+elif [[ "${command}" =~ \
+    ${WB_START}python3?[[:space:]]+-m[[:space:]]+pip${WB_END} ]]; then
   enforce "${py_mode}" "python -m pip"
-
-# Step 4: python -m venv -> enforce
-elif [[ "${command}" =~ ${WB_START}python3?[[:space:]]+-m[[:space:]]+venv${WB_END} ]]; then
+elif [[ "${command}" =~ \
+    ${WB_START}python3?[[:space:]]+-m[[:space:]]+venv${WB_END} ]]; then
   enforce "${py_mode}" "python -m venv"
+fi
 
-# Step 5: poetry -> blanket enforce with allowlist
-elif [[ "${command}" =~ ${WB_START}poetry[[:space:]]+([a-zA-Z]+) ]]; then
+# Block 2: poetry — independent (catches "pip diag && poetry add")
+if [[ "${command}" =~ ${WB_START}poetry[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "poetry" "${subcmd}" || enforce "${py_mode}" "poetry" "${subcmd}"
-elif [[ "${command}" =~ ${WB_START}poetry[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
+  is_allowed_subcommand "poetry" "${subcmd}" || \
+    enforce "${py_mode}" "poetry" "${subcmd}"
+elif [[ "${command}" =~ \
+    ${WB_START}poetry[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # poetry diagnostic — no-op
 elif [[ "${command}" =~ ${WB_START}poetry${WB_END} ]]; then
   enforce "${py_mode}" "poetry"  # bare poetry
+fi
 
-# Step 6: pipenv -> blanket enforce with allowlist
-elif [[ "${command}" =~ ${WB_START}pipenv[[:space:]]+([a-zA-Z]+) ]]; then
+# Block 3: pipenv — independent (catches "pip diag && pipenv install")
+if [[ "${command}" =~ ${WB_START}pipenv[[:space:]]+([a-zA-Z]+) ]]; then
   subcmd="${BASH_REMATCH[2]}"
-  is_allowed_subcommand "pipenv" "${subcmd}" || enforce "${py_mode}" "pipenv" "${subcmd}"
-elif [[ "${command}" =~ ${WB_START}pipenv[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
+  is_allowed_subcommand "pipenv" "${subcmd}" || \
+    enforce "${py_mode}" "pipenv" "${subcmd}"
+elif [[ "${command}" =~ \
+    ${WB_START}pipenv[[:space:]]+(--version|-[vVh]|--help)${WB_END} ]]; then
   :  # pipenv diagnostic — no-op
 elif [[ "${command}" =~ ${WB_START}pipenv${WB_END} ]]; then
   enforce "${py_mode}" "pipenv"  # bare pipenv
 fi
 ```
 
-**Note on elif chain**: The Python enforcement MUST use an elif chain
-(not separate if blocks) because `uv pip` contains the substring `pip`.
-With separate if blocks, the bare `pip` check would false-positive on
-`uv pip install`. The elif ordering (check `uv pip` first, then bare
-`pip`) is essential. See D7 for compound command edge cases and known
-limitations of the elif chain.
+**Note on independent blocks for poetry/pipenv**: Poetry and pipenv
+use independent if blocks (not elif from the pip chain) so cross-tool
+compound commands are caught. In `pip --version && poetry add
+requests`, the pip elif chain hits the diagnostic no-op and exits to
+`fi`; the independent poetry block then matches `poetry add`. The
+cross-tool case `pip --version && pipenv install` works identically:
+the pip elif exits to `fi`, then the independent pipenv block matches
+`pipenv install`. The pip/python-m family retains the elif chain
+because `uv pip` contains substring `pip` — a separate if block for
+pip would false-positive on `uv pip install` commands. Same-tool
+diagnostic compounds (`pipenv --version && pipenv install` and
+`poetry --help && poetry add requests`) are also correctly blocked:
+the first if-branch (`${WB_START}pipenv[[:space:]]+([a-zA-Z]+)` or
+`${WB_START}poetry[[:space:]]+([a-zA-Z]+)`, where `${WB_START}` is
+`(^|[^a-zA-Z0-9_])`) scans the full string. At the first occurrence,
+`--version` or `--help` fails `[a-zA-Z]+` (starts with `-`), so the
+regex finds the blocked subcommand at the second occurrence. The
+diagnostic elif branch is never entered.
 
 **JavaScript enforcement** — independent if blocks per tool (NOT elif):
 

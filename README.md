@@ -1,5 +1,7 @@
 # Plankton - Claude Code Hooks
 
+![Plankton mascot](assets/plankton-cover.png)
+
 A ready-to-use template for Claude Code hook-based code quality enforcement.
 Provides automated linting, formatting, and code quality checks that run
 during Claude Code sessions.
@@ -199,10 +201,10 @@ Configure subprocess timeout and model selection:
 | Key | Type | Default | Purpose |
 | --- | ---- | ------- | ------- |
 | `languages.<type>` | boolean | true | Enable/disable linting per language |
-| `protected_files` | string[] | 10 configs | Files protected from modification |
-| `exclusions` | string[] | tests/,docs/,... | Paths excluded from security linters |
-| `phases.auto_format` | boolean | true | Enable/disable Phase 1 auto-formatting |
-| `phases.subprocess_delegation` | boolean | true | Enable/disable Phase 3 subprocess |
+| `protected_files` | string[] | 10 files | Protected file list |
+| `exclusions` | string[] | tests/,docs/,... | Paths excluded from linters |
+| `phases.auto_format` | boolean | true | Toggle Phase 1 auto-format |
+| `phases.subprocess_delegation` | boolean | true | Toggle subprocess |
 | `subprocess.timeout` | number | 300 | Subprocess timeout in seconds |
 | `subprocess.model_selection.*` | varies | varies | Model selection patterns |
 | `jscpd.*` | varies | varies | Duplicate detection settings |
@@ -388,13 +390,13 @@ easier than remediating accumulated debt.
 | Tool | Install (macOS) | Install (Linux) | Purpose |
 | ---- | --------------- | --------------- | ------- |
 | `ty` | `uv add --dev ty` | Same | Python type checking |
-| `shfmt` | `brew install shfmt` | `go install mvdan.cc/sh/v3/cmd/shfmt@latest` | Shell formatting |
-| `shellcheck` | `brew install shellcheck` | `apt install shellcheck` | Shell linting |
+| `shfmt` | `brew install shfmt` | `apt install shfmt` | Shell formatting |
+| `shellcheck` | `brew install shellcheck` | `apt install shellcheck` | Lint |
 | `yamllint` | `uv add --dev yamllint` | Same | YAML linting |
-| `hadolint` | `brew install hadolint` | Download from GitHub | Dockerfile linting |
+| `hadolint` | `brew install hadolint` | GitHub releases | Dockerfile linting |
 | `taplo` | `brew install taplo` | Download from GitHub | TOML linting |
-| `markdownlint-cli2` | `npm install -g markdownlint-cli2` | Same | Markdown linting |
-| `actionlint` | `brew install actionlint` | Download from GitHub | GitHub Actions |
+| `markdownlint-cli2` | `npm i -g markdownlint-cli2` | Same | Markdown lint |
+| `actionlint` | `brew install actionlint` | GitHub releases | GitHub Actions |
 | `jscpd` | `npm install` (local) | Same | Duplicate detection |
 | `vulture` | `uv add --dev vulture` | Same | Dead code detection |
 | `bandit` | `uv add --dev bandit` | Same | Security scanning |

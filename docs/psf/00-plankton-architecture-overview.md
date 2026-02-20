@@ -1,9 +1,9 @@
-# Claude Code Hooks Portable Template - Architecture Overview
+# Plankton - Architecture Overview
 
 ## TL;DR
 
-- **Purpose**: Reusable template for automated code quality
-  enforcement via Claude Code hooks
+- **Purpose**: Reusable template (Plankton) for automated code
+  quality enforcement via Claude Code hooks
 - **Scope**: Hook scripts (`.claude/hooks/`), linter configs,
   CI/pre-commit pipelines
 - **Key responsibilities**:
@@ -21,8 +21,7 @@
 - **Goals**: Portable, zero-violation baseline with
   automated enforcement in CC sessions and pre-commit
 - **Non-goals**: Runtime app code; IDE integration
-  beyond Claude Code; custom linter rule authoring;
-  spec review skills (`.claude/spec/`)
+  beyond Claude Code; custom linter rule authoring
 - **Upstream**: Claude Code runtime (hook lifecycle:
   PreToolUse, PostToolUse, Stop); `claude -p` CLI
 - **Downstream**: Adopting projects inherit hooks,
@@ -155,7 +154,7 @@ graph TB
 
 ### multi_linter.sh (PostToolUse Hook)
 
-- **Location**: `.claude/hooks/multi_linter.sh` (~1,286 lines)
+- **Location**: `.claude/hooks/multi_linter.sh` (~1,287 lines)
 - **Responsibilities**:
   - Dispatches files to language-specific handlers based on extension
   - Runs three-phase lint: format, collect
@@ -332,7 +331,7 @@ graph TB
 
 ## Risks, Tech Debt, Open Questions
 
-- **Shell script size**: `multi_linter.sh` ~1,286
+- **Shell script size**: `multi_linter.sh` ~1,287
   lines; per-language modules would help
 - **Fragile parsing**: yamllint/flake8/markdownlint
   output parsed via `sed`; format changes break it
@@ -352,16 +351,14 @@ graph TB
   TypeScript support (installs Biome, creates configs)
 - **`tests/stress/run_stress_tests.sh`**: Stress test
   suite for hook performance under load
-- **`docs/adr-*.md`**: Architecture Decision Records
-  (hook schema, package manager, TS expansion)
-- **`docs/adr-implementation-plans/`**: Implementation
-  plans for major features (TS hooks expansion)
-- **`docs/stress-test-report.md`**: Results from hook
+- **`docs/specs/adr-*.md`**: Architecture Decision Records
+  (hook schema, package manager, CLI tool prefs, TS expansion)
+- **`docs/specs/stress-test-report.md`**: Results from hook
   stress testing
-- **`docs/portable-hooks-template.md`**: Template
+- **`docs/specs/portable-hooks-template.md`**: Template
   adoption guide
-- **`.claude/spec/`**: Spec review skill definitions
-  (out of scope for hook architecture)
+- **`docs/specs/linear-issue-hook-messages.md`**: Hook
+  message formatting spec for Linear issue integration
 
 ## Glossary
 
