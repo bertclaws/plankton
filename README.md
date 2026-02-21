@@ -14,7 +14,8 @@ committing again, getting more errors. It's maddening. And the worst part:
 agents will happily modify your linter configs to make violations disappear
 instead of fixing the code. The rules get weaker and nobody notices.
 
-Plankton enforces your standards programmatically at write-time, before commits and code review. The agent is
+Plankton enforces your standards programmatically at write-time, before
+commits and code review. The agent is
 blocked from proceeding until its output passes your checks. A three-phase
 system auto-formats first (fixing ~40-50% of issues silently), collects
 remaining violations as structured JSON via 20+ fast Rust-based linters, then
@@ -33,12 +34,20 @@ Plankton is the enforcement dimension of that layer.
 Like the organism: tiny, everywhere, filtering everything.
 
 > [!CAUTION]
-> Research project under active development. APIs change without
-> notice, hooks may break on CLI updates. Use at your own risk.
+> Research project under active development. Hooks are tested against
+> Claude Code >= 2.1.50 (see badge). Newer CC versions usually work
+> but are not guaranteed. If you encounter breakage, file an issue
+> including the output of `claude --version`.
 
 ## quick start
 
-1. **Use this template** to create a new repository
+1. **Clone the repository**:
+
+   ```bash
+   git clone https://github.com/alexfazio/plankton.git
+   cd plankton
+   ```
+
 2. **Install dependencies**:
 
    ```bash
@@ -93,7 +102,8 @@ type errors (~25s). Tokens aren't wasted on easy fixes; hard problems get the
 reasoning they need.
 
 The Boy Scout Rule ties it together: edit a file, own all its
-violations, pre-existing or not. No exceptions. Like reinforcement learning signals, these
+violations, pre-existing or not. No exceptions. Like reinforcement
+learning signals, these
 corrections shape how the agent writes code, actively preventing bad patterns
 rather than cleaning up after the fact.
 
@@ -158,7 +168,6 @@ agents modify linting rules, and more.
 - `multi_linter.sh` is ~1,300 lines and should split into one file per hook type
 - 103-test integration suite exists but needs work; Claude subprocess
   stochasticity makes deterministic assertions hard
-- need a strategy for surviving Claude Code CLI updates without breaking
 - measuring LLM+Plankton vs LLM-alone would be useful but needs benchmarking
   expertise, contributions welcome here
 
