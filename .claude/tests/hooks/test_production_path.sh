@@ -42,19 +42,16 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   exit 0
 fi
 
-# --- Ensure no-hooks settings file exists (hook auto-creates but we need it) ---
-settings_file="${HOME}/.claude/no-hooks-settings.json"
-created_settings=false
-if [[ ! -f "${settings_file}" ]]; then
-  mkdir -p "${HOME}/.claude"
-  cat >"${settings_file}" <<'SETTINGS_EOF'
+# --- Isolate HOME from real user home ---
+isolated_home="${tmp_dir}/home"
+mkdir -p "${isolated_home}/.claude"
+cat >"${isolated_home}/.claude/no-hooks-settings.json" <<'SETTINGS_EOF'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "disableAllHooks": true
 }
 SETTINGS_EOF
-  created_settings=true
-fi
+export HOME="${isolated_home}"
 
 # --- Helper: create a fake CLAUDE_PROJECT_DIR with config ---
 setup_project_dir() {
@@ -269,11 +266,6 @@ assert "test4_exit" "[[ ${test4_exit} -eq 2 ]]" \
 assert "test4_no_call" "[[ ! -f '${test4_marker}' ]]" \
   "mock claude was NOT called" \
   "mock claude was called (marker file exists)"
-
-# === Cleanup settings file if we created it ===
-if [[ "${created_settings}" == "true" ]] && [[ -f "${settings_file}" ]]; then
-  rm -f "${settings_file}"
-fi
 
 # === Summary ===
 printf "\n=== Summary ===\n"

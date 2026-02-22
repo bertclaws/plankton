@@ -19,7 +19,17 @@ project_dir="$(cd "${script_dir}/../../.." && pwd)"
 
 # --- Temp directory with cleanup trap ---
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "${tmp_dir}"' EXIT
+trap 'rm -rf "${tmp_dir}" "${project_dir}/test_fixture_broken.toml"' EXIT
+
+# --- Shared test fixture (decouples tests from production config) ---
+fixture_project_dir="${tmp_dir}/fixture_project"
+mkdir -p "${fixture_project_dir}/.claude/hooks"
+fixtures_dir="$(dirname "${BASH_SOURCE[0]}")/fixtures"
+cp "${fixtures_dir}/config.json" "${fixture_project_dir}/.claude/hooks/config.json"
+cp "${fixtures_dir}/.markdownlint-cli2.jsonc" "${fixture_project_dir}/.markdownlint-cli2.jsonc"
+# Copy .markdownlint.jsonc rules file if it exists
+[[ -f "${project_dir}/.markdownlint.jsonc" ]] && \
+  cp "${project_dir}/.markdownlint.jsonc" "${fixture_project_dir}/.markdownlint.jsonc"
 
 # --- Counters ---
 passed=0
@@ -41,7 +51,7 @@ run_check() {
   local stderr_output=""
   local actual_exit=0
   stderr_output=$(echo "${json_input}" \
-    | HOOK_SKIP_SUBPROCESS=1 CLAUDE_PROJECT_DIR="${project_dir}" \
+    | HOOK_SKIP_SUBPROCESS=1 CLAUDE_PROJECT_DIR="${fixture_project_dir}" \
       bash "${hook_dir}/multi_linter.sh" 2>&1 >/dev/null) || actual_exit=$?
 
   # Helper: record pass or fail
@@ -149,10 +159,10 @@ fi
 # project tree (files in /tmp are outside the include glob and get excluded).
 gate_linter "taplo" "toml"
 if [[ "${_gl_available}" -eq 1 ]]; then
+  # taplo resolves include globs relative to CWD (project root), so the
+  # fixture must be inside the project tree. Cleanup is EXIT-trapped.
   toml_file="${project_dir}/test_fixture_broken.toml"
   printf '[broken\nkey = "value"\n' >"${toml_file}"
-  # shellcheck disable=SC2064
-  trap "rm -rf '${tmp_dir}' '${toml_file}'" EXIT
   run_check "toml" "${toml_file}" 1
 fi
 
@@ -172,7 +182,7 @@ if ! command -v biome >/dev/null 2>&1; then
   _ts_reason="biome not installed"
 else
   ts_enabled=$(jaq -r '.languages.typescript.enabled // true' \
-    "${project_dir}/.claude/hooks/config.json" 2>/dev/null) || ts_enabled="false"
+    "${fixture_project_dir}/.claude/hooks/config.json" 2>/dev/null) || ts_enabled="false"
   [[ "${ts_enabled}" != "true" ]] && _ts_reason="not enabled in config"
 fi
 if [[ -n "${_ts_reason}" ]]; then

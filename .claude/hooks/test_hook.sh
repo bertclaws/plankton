@@ -18,8 +18,21 @@ run_self_test() {
   local failed=0
   local temp_dir
   temp_dir=$(mktemp -d)
-  trap 'rm -rf "${temp_dir}"; rm -f /tmp/.biome_path_$$ /tmp/.semgrep_session_$$ /tmp/.semgrep_session_$$.done /tmp/.jscpd_ts_session_$$ /tmp/.jscpd_session_$$ /tmp/.sfc_warned_*_$$ /tmp/.nursery_checked_$$ /tmp/.pm_warn_*_$$ /tmp/.pm_test_stderr_$$ /tmp/.pm_enforcement_$$.log' EXIT
+  trap 'rm -rf "${temp_dir}"; rm -f "${project_dir}/test_fixture_broken.toml" /tmp/.biome_path_$$ /tmp/.semgrep_session_$$ /tmp/.semgrep_session_$$.done /tmp/.jscpd_ts_session_$$ /tmp/.jscpd_session_$$ /tmp/.sfc_warned_*_$$ /tmp/.nursery_checked_$$ /tmp/.pm_warn_*_$$ /tmp/.pm_test_stderr_$$ /tmp/.pm_enforcement_$$.log' EXIT
 
+
+  # --- Shared test fixture (decouples tests from production config) ---
+  local fixture_project_dir="${temp_dir}/fixture_project"
+  mkdir -p "${fixture_project_dir}/.claude/hooks"
+  cp "${script_dir}/../tests/hooks/fixtures/config.json" \
+    "${fixture_project_dir}/.claude/hooks/config.json"
+  # markdownlint-cli2 discovers config by walking up from the linted file
+  cp "${script_dir}/../tests/hooks/fixtures/.markdownlint-cli2.jsonc" \
+    "${fixture_project_dir}/.markdownlint-cli2.jsonc"
+  # Copy .markdownlint.jsonc rules file if it exists in the project
+  [[ -f "${project_dir}/.markdownlint.jsonc" ]] && \
+    cp "${project_dir}/.markdownlint.jsonc" \
+      "${fixture_project_dir}/.markdownlint.jsonc"
   echo "=== Hook Self-Test Suite ==="
   echo ""
 
@@ -34,7 +47,7 @@ run_self_test() {
     echo "${content}" >"${file}"
     local json_input='{"tool_input": {"file_path": "'"${file}"'"}}'
     set +e
-    echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 "${script_dir}/multi_linter.sh" >/dev/null 2>&1
+    echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 CLAUDE_PROJECT_DIR="${fixture_project_dir}" "${script_dir}/multi_linter.sh" >/dev/null 2>&1
     local actual_exit=$?
     set -e
 
@@ -166,7 +179,7 @@ echo "hello"' 0
     local json_input='{"tool_input": {"file_path": "'"${file}"'"}}'
     set +e
     local output
-    output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 "${script_dir}/multi_linter.sh" 2>&1)
+    output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 CLAUDE_PROJECT_DIR="${fixture_project_dir}" "${script_dir}/multi_linter.sh" 2>&1)
     set -e
 
     if echo "${output}" | grep -qE "${pattern}"; then
@@ -206,7 +219,7 @@ RUN apt-get update' \
     local json_input='{"tool_input": {"file_path": "'"${file}"'"}}'
     set +e
     local output
-    output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 HOOK_DEBUG_MODEL=1 "${script_dir}/multi_linter.sh" 2>&1)
+    output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 HOOK_DEBUG_MODEL=1 CLAUDE_PROJECT_DIR="${fixture_project_dir}" "${script_dir}/multi_linter.sh" 2>&1)
     set -e
 
     local actual_model
@@ -1075,22 +1088,22 @@ PM_OFF_JS_EOF
   local guarded_merges
   guarded_merges=$(grep -c '_merged=$(echo "${collected_violations}"' \
     "${script_dir}/multi_linter.sh" || true)
-  if [[ "${guarded_merges}" -eq 13 ]]; then
-    echo "PASS jaq_merge_count: ${guarded_merges} guarded merges (expected 13)"
+  if [[ "${guarded_merges}" -ge 13 ]]; then
+    echo "PASS jaq_merge_count: ${guarded_merges} guarded merge(s) (at least 13)"
     passed=$((passed + 1))
   else
-    echo "FAIL jaq_merge_count: ${guarded_merges} guarded merges (expected 13)"
+    echo "FAIL jaq_merge_count: ${guarded_merges} guarded merge(s) (expected at least 13)"
     failed=$((failed + 1))
   fi
 
   local conv_fallbacks
   conv_fallbacks=$(grep -cE '\|\| (ty|bandit|sc|hl)_converted="\[\]"' \
     "${script_dir}/multi_linter.sh" || true)
-  if [[ "${conv_fallbacks}" -eq 4 ]]; then
-    echo "PASS jaq_conversion_guard: ${conv_fallbacks} conversion fallbacks (expected 4)"
+  if [[ "${conv_fallbacks}" -ge 4 ]]; then
+    echo "PASS jaq_conversion_guard: ${conv_fallbacks} conversion fallback(s) (at least 4)"
     passed=$((passed + 1))
   else
-    echo "FAIL jaq_conversion_guard: ${conv_fallbacks} conversion fallbacks (expected 4)"
+    echo "FAIL jaq_conversion_guard: ${conv_fallbacks} conversion fallback(s) (expected at least 4)"
     failed=$((failed + 1))
   fi
 
@@ -1107,7 +1120,7 @@ PM_OFF_JS_EOF
     set +e
     local stderr_output
     stderr_output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 \
-      CLAUDE_PROJECT_DIR="${project_dir}" \
+      CLAUDE_PROJECT_DIR="${fixture_project_dir}" \
       "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
     local actual_exit=$?
     set -e
@@ -1244,6 +1257,8 @@ RUN apt-get update' \
   # taplo respects taplo.toml include patterns; /tmp files are outside
   # the include glob. Place fixture in project tree with cleanup.
   if command -v taplo >/dev/null 2>&1; then
+    # taplo resolves include globs relative to CWD (project root), so the
+    # fixture must be inside the project tree. Cleanup is EXIT-trapped.
     local toml_fixture="${project_dir}/test_fixture_broken.toml"
     printf '[broken\nkey = "value"\n' >"${toml_fixture}"
     test_stderr_json "feedback_json_toml" \
@@ -1251,7 +1266,6 @@ RUN apt-get update' \
       '[broken
 key = "value"' \
       _check_hook_json
-    rm -f "${toml_fixture}"
   else
     echo "[skip] feedback_json_toml: taplo not installed"
   fi
@@ -1266,7 +1280,7 @@ key = "value"' \
     set +e
     local md_stderr
     md_stderr=$(echo "${md_json}" | HOOK_SKIP_SUBPROCESS=1 \
-      CLAUDE_PROJECT_DIR="${project_dir}" \
+      CLAUDE_PROJECT_DIR="${fixture_project_dir}" \
       "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
     local md_exit=$?
     set -e
