@@ -48,34 +48,21 @@ for per-language installation and configuration.
 
 ## what is plankton
 
-AI coding agents write fast but they don't follow your rules. Formatting
-drifts, naming conventions get ignored, dead code piles up as agents iterate
-and refactor, and stylistic choices you actually care about (quote style,
-import ordering, docstring format, complexity thresholds) get quietly
-overridden on every edit. You end up in this endless loop of copy-pasting
-pre-commit errors back into the agent, watching it fix half of them,
-committing again, getting more errors. It's maddening. And the worst part:
-agents will happily modify your linter configs to make violations disappear
-instead of fixing the code. The rules get weaker and nobody notices.
+Code quality gate enforcement at write-time, using Claude Code hooks. The
+agent is blocked from proceeding until its output passes your checks —
+style, types, security, complexity — all enforced before commits and code
+review.
 
-Plankton enforces your standards programmatically at write-time, before
-commits and code review. The agent is
-blocked from proceeding until its output passes your checks. A three-phase
-system auto-formats first (fixing ~40-50% of issues silently), collects
-remaining violations as structured JSON via 20+ fast Rust-based linters, then
-delegates what's left to dedicated Claude instances that reason about each
-violation and produce targeted repairs. Model routing sends simple fixes to
-fast models and complex refactoring to capable ones, right-sizing intelligence
-to problem complexity so tokens aren't wasted. Covers Python, TypeScript/
-JS/CSS, Shell, YAML, Markdown, Dockerfile, TOML, and JSON — 8 languages, each
-with its own enforcement pipeline.
+- **Higher pass rate** — write-time feedback catches bugs, type errors,
+  and anti-patterns that would otherwise cause test failures.
+- **Behavioral shift** — with Plankton active, the model learns from
+  write-time feedback and produces better code *during* generation,
+  not just through post-hoc formatting.
+- **Compound quality** — improvements across multiple dimensions
+  compound into code that is more likely to be functionally correct.
 
-Agentic coding created a [new programmable
-layer](https://x.com/karpathy/status/2004607146781278521): agents, hooks,
-MCP, permissions, tools. Everyone's still figuring out how to hold it.
-Plankton is the enforcement dimension of that layer.
-
-Like the organism: tiny, everywhere, filtering everything.
+For the full motivation and design story, read the
+[original writeup](https://x.com/alxfazio/status/2024931367612743688).
 
 ## verify
 
