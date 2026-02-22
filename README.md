@@ -190,7 +190,7 @@ agents modify linting rules, and more.
 
 Contributions are welcome.
 
-## Star History
+## star history
 
 <!-- markdownlint-disable MD033 MD013 -->
 <a href="https://star-history.com/#alexfazio/plankton&Date">
