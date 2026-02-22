@@ -384,9 +384,35 @@ console.log(x);' 0
 }' 2
 
     # Test 5: Config: TS disabled -> exit 0 (skip)
-    test_temp_file "TS disabled skips" \
-      "${temp_dir}/skipped.ts" \
-      'const unused = "should be skipped";' 0
+    # Uses its own config fixture with typescript disabled
+    ts_disabled_dir="${temp_dir}/ts_disabled_project"
+    mkdir -p "${ts_disabled_dir}/.claude/hooks"
+    cat > "${ts_disabled_dir}/.claude/hooks/config.json" << 'TS_DIS_EOF'
+{
+  "languages": {
+    "python": true, "shell": true, "yaml": true, "json": true,
+    "toml": true, "dockerfile": true, "markdown": true,
+    "typescript": false
+  },
+  "phases": { "auto_format": true, "subprocess_delegation": true }
+}
+TS_DIS_EOF
+    local ts_dis_file="${temp_dir}/skipped.ts"
+    echo 'const unused = "should be skipped";' > "${ts_dis_file}"
+    local ts_dis_json='{"tool_input": {"file_path": "'"${ts_dis_file}"'"}}'
+    set +e
+    echo "${ts_dis_json}" | HOOK_SKIP_SUBPROCESS=1 \
+      CLAUDE_PROJECT_DIR="${ts_disabled_dir}" \
+      "${script_dir}/multi_linter.sh" >/dev/null 2>&1
+    local ts_dis_exit=$?
+    set -e
+    if [[ "${ts_dis_exit}" -eq 0 ]]; then
+      echo "PASS TS disabled skips: exit ${ts_dis_exit} (expected 0)"
+      passed=$((passed + 1))
+    else
+      echo "FAIL TS disabled skips: exit ${ts_dis_exit} (expected 0)"
+      failed=$((failed + 1))
+    fi
 
     # Test 6: CSS clean -> exit 0
     test_ts_file "CSS clean file" \
@@ -1030,6 +1056,296 @@ PM_OFF_JS_EOF
   echo "--- Yarn Info Allowed ---"
   test_bash_command "yarn info allowed" \
     "yarn info lodash" "approve" "${pm_project_dir}"
+
+  echo ""
+  echo "--- jaq Error Protection Tests ---"
+
+  # Test: no direct collected_violations jaq merge assignments
+  local unprotected_merges
+  unprotected_merges=$(grep -c 'collected_violations=$(echo "${collected_violations}"' \
+    "${script_dir}/multi_linter.sh" || true)
+  if [[ "${unprotected_merges}" -eq 0 ]]; then
+    echo "PASS jaq_merge_guard: no unprotected merge assignments"
+    passed=$((passed + 1))
+  else
+    echo "FAIL jaq_merge_guard: ${unprotected_merges} unprotected merge(s) found"
+    failed=$((failed + 1))
+  fi
+
+  local guarded_merges
+  guarded_merges=$(grep -c '_merged=$(echo "${collected_violations}"' \
+    "${script_dir}/multi_linter.sh" || true)
+  if [[ "${guarded_merges}" -eq 13 ]]; then
+    echo "PASS jaq_merge_count: ${guarded_merges} guarded merges (expected 13)"
+    passed=$((passed + 1))
+  else
+    echo "FAIL jaq_merge_count: ${guarded_merges} guarded merges (expected 13)"
+    failed=$((failed + 1))
+  fi
+
+  local conv_fallbacks
+  conv_fallbacks=$(grep -cE '\|\| (ty|bandit|sc|hl)_converted="\[\]"' \
+    "${script_dir}/multi_linter.sh" || true)
+  if [[ "${conv_fallbacks}" -eq 4 ]]; then
+    echo "PASS jaq_conversion_guard: ${conv_fallbacks} conversion fallbacks (expected 4)"
+    passed=$((passed + 1))
+  else
+    echo "FAIL jaq_conversion_guard: ${conv_fallbacks} conversion fallbacks (expected 4)"
+    failed=$((failed + 1))
+  fi
+
+  echo ""
+  echo "--- Feedback Loop Regression Tests ---"
+
+  # Helper: capture stderr only and validate via check function.
+  # Unlike test_output_format (merges stdout+stderr), this isolates stderr
+  # for JSON structure validation of hook feedback output.
+  test_stderr_json() {
+    local name="$1" file="$2" content="$3" check_fn="$4"
+    echo "${content}" >"${file}"
+    local json_input='{"tool_input": {"file_path": "'"${file}"'"}}'
+    set +e
+    local stderr_output
+    stderr_output=$(echo "${json_input}" | HOOK_SKIP_SUBPROCESS=1 \
+      CLAUDE_PROJECT_DIR="${project_dir}" \
+      "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
+    local actual_exit=$?
+    set -e
+    if "${check_fn}" "${stderr_output}" "${actual_exit}"; then
+      echo "PASS ${name}"
+      passed=$((passed + 1))
+    else
+      echo "FAIL ${name}"
+      echo "   exit=${actual_exit}"
+      echo "   stderr: ${stderr_output:0:200}"
+      failed=$((failed + 1))
+    fi
+  }
+
+  # Check: exit 2 + [hook] prefix + valid JSON array + required keys.
+  # Handles multi-line JSON and multiple [hook] lines (e.g. markdown
+  # emits a debug summary before the JSON payload).
+  _check_hook_json() {
+    local stderr="$1" exit_code="$2"
+    [[ "${exit_code}" -ne 2 ]] && return 1
+    # Find line number of the LAST [hook] line
+    local last_hook_info
+    last_hook_info=$(echo "${stderr}" | grep -n '^\[hook\] ' | tail -1)
+    [[ -z "${last_hook_info}" ]] && return 1
+    local line_num="${last_hook_info%%:*}"
+    # Extract everything from that line onward, strip prefix from first line
+    local json_part
+    json_part=$(echo "${stderr}" | tail -n +"${line_num}")
+    json_part="${json_part#\[hook\] }"
+    echo "${json_part}" | jaq 'type == "array"' 2>/dev/null \
+      | grep -q 'true' || return 1
+    # Check all 5 unified schema keys: all handlers now convert to
+    # {line, column, code, message, linter} during Phase 2 collection.
+    local valid
+    valid=$(echo "${json_part}" | jaq '[.[] |
+      has("line") and has("column") and has("code")
+      and has("message") and has("linter")] | all' 2>/dev/null)
+    [[ "${valid}" != "true" ]] && return 1
+    return 0
+  }
+
+  # Structural: rerun_phase2 call has | tail -1 guard (Step 1 regression)
+  local tail_guard
+  tail_guard=$(grep -c 'rerun_phase2.*| tail -1' \
+    "${script_dir}/multi_linter.sh" || true)
+  if [[ "${tail_guard}" -ge 1 ]]; then
+    echo "PASS rerun_phase2_tail_guard: | tail -1 present on rerun_phase2 call"
+    passed=$((passed + 1))
+  else
+    echo "FAIL rerun_phase2_tail_guard: | tail -1 missing from rerun_phase2 call"
+    failed=$((failed + 1))
+  fi
+
+  # Feedback JSON: Python (ruff F841 — unused variable)
+  test_stderr_json "feedback_json_python" \
+    "${temp_dir}/feedback_test.py" \
+    '"""Module."""
+
+
+def foo():
+    """Do nothing."""
+    x = 1
+    return 42' \
+    _check_hook_json
+
+  # Unified schema: Python ruff violations must have line/column keys
+  # (not raw location.row/location.column from ruff JSON)
+  _check_ruff_unified() {
+    local stderr="$1" exit_code="$2"
+    [[ "${exit_code}" -ne 2 ]] && return 1
+    local last_hook_info
+    last_hook_info=$(echo "${stderr}" | grep -n '^\[hook\] ' | tail -1)
+    [[ -z "${last_hook_info}" ]] && return 1
+    local line_num="${last_hook_info%%:*}"
+    local json_part
+    json_part=$(echo "${stderr}" | tail -n +"${line_num}")
+    json_part="${json_part#\[hook\] }"
+    # Check all 5 unified schema keys on every element
+    local valid
+    valid=$(echo "${json_part}" | jaq '[.[] |
+      has("line") and has("column") and has("code")
+      and has("message") and has("linter")] | all' 2>/dev/null)
+    [[ "${valid}" != "true" ]] && return 1
+    return 0
+  }
+  test_stderr_json "ruff_unified_schema" \
+    "${temp_dir}/feedback_test.py" \
+    '"""Module."""
+
+
+def foo():
+    """Do nothing."""
+    x = 1
+    return 42' \
+    _check_ruff_unified
+
+  # Feedback JSON: Shell (SC2034 + SC2154 + SC2086)
+  test_stderr_json "feedback_json_shell" \
+    "${temp_dir}/feedback_test.sh" \
+    '#!/bin/bash
+unused="x"
+echo $y' \
+    _check_hook_json
+
+  # Feedback JSON: JSON syntax error
+  test_stderr_json "feedback_json_json" \
+    "${temp_dir}/feedback_test.json" \
+    '{invalid}' \
+    _check_hook_json
+
+  # Feedback JSON: YAML (gated on yamllint)
+  if command -v yamllint >/dev/null 2>&1; then
+    test_stderr_json "feedback_json_yaml" \
+      "${temp_dir}/feedback_test.yaml" \
+      'key: value
+ bad_indent: true' \
+      _check_hook_json
+  else
+    echo "[skip] feedback_json_yaml: yamllint not installed"
+  fi
+
+  # Feedback JSON: Dockerfile (gated on hadolint)
+  if command -v hadolint >/dev/null 2>&1; then
+    test_stderr_json "feedback_json_dockerfile" \
+      "${temp_dir}/feedback_test.dockerfile" \
+      'FROM ubuntu
+RUN apt-get update' \
+      _check_hook_json
+  else
+    echo "[skip] feedback_json_dockerfile: hadolint not installed"
+  fi
+
+  # Feedback JSON: TOML (gated on taplo)
+  # taplo respects taplo.toml include patterns; /tmp files are outside
+  # the include glob. Place fixture in project tree with cleanup.
+  if command -v taplo >/dev/null 2>&1; then
+    local toml_fixture="${project_dir}/test_fixture_broken.toml"
+    printf '[broken\nkey = "value"\n' >"${toml_fixture}"
+    test_stderr_json "feedback_json_toml" \
+      "${toml_fixture}" \
+      '[broken
+key = "value"' \
+      _check_hook_json
+    rm -f "${toml_fixture}"
+  else
+    echo "[skip] feedback_json_toml: taplo not installed"
+  fi
+
+  # Feedback JSON: Markdown (gated on markdownlint-cli2)
+  # Use 201 'x' chars to trigger MD013 (line length, not auto-fixable)
+  if command -v markdownlint-cli2 >/dev/null 2>&1; then
+    local md_fixture="${temp_dir}/feedback_test.md"
+    printf 'x%.0s' {1..201} >"${md_fixture}"
+    printf '\n' >>"${md_fixture}"
+    local md_json='{"tool_input": {"file_path": "'"${md_fixture}"'"}}'
+    set +e
+    local md_stderr
+    md_stderr=$(echo "${md_json}" | HOOK_SKIP_SUBPROCESS=1 \
+      CLAUDE_PROJECT_DIR="${project_dir}" \
+      "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
+    local md_exit=$?
+    set -e
+    if _check_hook_json "${md_stderr}" "${md_exit}"; then
+      echo "PASS feedback_json_markdown"
+      passed=$((passed + 1))
+    else
+      echo "FAIL feedback_json_markdown"
+      echo "   exit=${md_exit}"
+      echo "   stderr: ${md_stderr:0:200}"
+      failed=$((failed + 1))
+    fi
+    # Markdown single [hook] line: stderr should have exactly 1 [hook] prefix
+    # (the JSON payload only, no debug summary line)
+    local hook_line_count
+    hook_line_count=$(echo "${md_stderr}" | grep -c '^\[hook\] ' || true)
+    if [[ "${hook_line_count}" -eq 1 ]]; then
+      echo "PASS markdown_single_hook_line: 1 [hook] line (no debug summary)"
+      passed=$((passed + 1))
+    else
+      echo "FAIL markdown_single_hook_line: ${hook_line_count} [hook] lines (expected 1)"
+      failed=$((failed + 1))
+    fi
+  else
+    echo "[skip] feedback_json_markdown: markdownlint-cli2 not installed"
+    echo "[skip] markdown_single_hook_line: markdownlint-cli2 not installed"
+  fi
+
+  # Feedback JSON: TypeScript (gated on biome, uses ts_project_dir)
+  if [[ -n "${biome_cmd:-}" ]]; then
+    local ts_feedback_file="${temp_dir}/feedback_test.ts"
+    echo 'const unused = "x";
+console.log("test");' >"${ts_feedback_file}"
+    local ts_json='{"tool_input": {"file_path": "'"${ts_feedback_file}"'"}}'
+    set +e
+    local ts_stderr
+    ts_stderr=$(echo "${ts_json}" | HOOK_SKIP_SUBPROCESS=1 \
+      CLAUDE_PROJECT_DIR="${ts_project_dir}" \
+      "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
+    local ts_exit=$?
+    set -e
+    if _check_hook_json "${ts_stderr}" "${ts_exit}"; then
+      echo "PASS feedback_json_typescript"
+      passed=$((passed + 1))
+    else
+      echo "FAIL feedback_json_typescript"
+      echo "   exit=${ts_exit}"
+      echo "   stderr: ${ts_stderr:0:200}"
+      failed=$((failed + 1))
+    fi
+  else
+    echo "[skip] feedback_json_typescript: biome not installed"
+  fi
+
+  # Violation count: Shell (must have >= 2 violations)
+  local shell_count_input='{"tool_input": {"file_path": "'"${temp_dir}/feedback_test.sh"'"}}'
+  set +e
+  local shell_count_stderr
+  shell_count_stderr=$(echo "${shell_count_input}" | HOOK_SKIP_SUBPROCESS=1 \
+    CLAUDE_PROJECT_DIR="${project_dir}" \
+    "${script_dir}/multi_linter.sh" 2>&1 >/dev/null)
+  set -e
+  local shell_hook_info
+  shell_hook_info=$(echo "${shell_count_stderr}" | grep -n '^\[hook\] ' | tail -1)
+  local shell_line_num="${shell_hook_info%%:*}"
+  local shell_json_extract=""
+  if [[ -n "${shell_line_num}" ]]; then
+    shell_json_extract=$(echo "${shell_count_stderr}" | tail -n +"${shell_line_num}")
+    shell_json_extract="${shell_json_extract#\[hook\] }"
+  fi
+  local shell_count
+  shell_count=$(echo "${shell_json_extract}" | jaq 'length' 2>/dev/null || echo "0")
+  if [[ "${shell_count}" -ge 2 ]]; then
+    echo "PASS feedback_count_shell: ${shell_count} violations (>= 2)"
+    passed=$((passed + 1))
+  else
+    echo "FAIL feedback_count_shell: ${shell_count} violations (expected >= 2)"
+    failed=$((failed + 1))
+  fi
 
   # Summary
   echo ""

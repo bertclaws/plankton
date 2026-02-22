@@ -165,7 +165,7 @@ graph TB
 
 ### multi_linter.sh (PostToolUse Hook)
 
-- **Location**: `.claude/hooks/multi_linter.sh` (~1,287 lines)
+- **Location**: `.claude/hooks/multi_linter.sh` (~1,314 lines)
 - **Responsibilities**:
   - Dispatches files to language-specific handlers based on extension
   - Runs three-phase lint: format, collect
@@ -181,6 +181,10 @@ graph TB
   - Verification pass re-runs Phase 1 + Phase 2 after subprocess exits
 - **Inputs**: stdin JSON `{"tool_input": {"file_path": "..."}}` from Claude Code
 - **Outputs**: Exit 0 (clean) or exit 2 + stderr message (violations remain)
+- **Delivery**: Exit 2 + stderr output is delivered to the model as a
+  `<system-reminder>` tag embedded inside the `tool_result.content` string
+  (confirmed via mitmproxy 3/3 iterations; JSONL format does not capture
+  the tag wrapper)
 
 ### protect_linter_configs.sh (PreToolUse Hook)
 
@@ -205,13 +209,15 @@ graph TB
 
 ### config.json (Runtime Configuration)
 
-- **Location**: `.claude/hooks/config.json` (~80 lines)
+- **Location**: `.claude/hooks/config.json` (~81 lines)
 - **Responsibilities**: Central config for all hooks -
   language toggles, protected files, exclusions,
   phase control, model patterns, jscpd settings,
   package manager enforcement
 - **Implementation**: Loaded by `load_config()`;
   parsed with `jaq`. Falls back to defaults if missing
+- **`cc_tested_version`**: Tracks the CC CLI version
+  against which the hook was last verified (e.g., `"2.1.50"`)
 - **TypeScript sub-options**: `biome_unsafe_autofix`
   (unsafe Biome fixes), `oxlint_tsgolint` (oxlint
   integration), `tsgo` (TypeScript Go compiler),
@@ -239,7 +245,7 @@ graph TB
 
 ### test_hook.sh (Debug/Test Utility)
 
-- **Location**: `.claude/hooks/test_hook.sh` (~1,106 lines)
+- **Location**: `.claude/hooks/test_hook.sh` (~1,396 lines)
 - **Responsibilities**: Self-test suite covering all
   file types, model selection, TS handling, config
   protection, and edge cases
@@ -250,7 +256,8 @@ graph TB
 ## Data Model
 
 - **Violation schema**: `{line, column, code,
-  message, linter}` - unified across all linters
+  message, linter}` — all handlers convert to this
+  format during Phase 2 collection (see `multi_linter.sh`)
 - **Hook input**: `{"tool_input": {"file_path": string}}` from Claude Code via stdin
 - **PreToolUse output**: `{"decision": "approve"|"block", "reason"?: string}`
 - **Stop output**: `{"decision": "approve"|"block",
@@ -327,6 +334,17 @@ graph TB
   parallel agents (dep-agent 29, ml-agent 42,
   pm-agent 32) via TeamCreate; results in
   `.claude/tests/hooks/results/`
+- **Diagnostic test scripts** (`.claude/tests/hooks/`):
+  - `minimal-test-hook.sh` — stub hook emitting 3 violations to isolate
+    feedback loop
+  - `swap_settings.sh` — swaps `settings.json` for test isolation
+  - `test_five_channels.sh` — tests 5 PostToolUse output channels
+    (stderr/JSON × exit codes)
+  - `test_production_path.sh` — tests subprocess delegation with mock
+    `claude` binary
+  - `verify_feedback_loop.sh` — verifies `multi_linter.sh` produces
+    correct stderr JSON + exit 2; automates Step 2 of
+    `make-plankton-work.md`
 - **Pre-commit**: 15-hook pipeline mirrors CC hook
   phases; runs `uv run pre-commit run --all-files`
 - **CI**: GitHub Actions runs pre-commit (lint) + pytest (test) on push/PR to main
@@ -365,7 +383,7 @@ graph TB
 
 ## Risks, Tech Debt, Open Questions
 
-- **Shell script size**: `multi_linter.sh` ~1,287
+- **Shell script size**: `multi_linter.sh` ~1,314
   lines; per-language modules would help
 - **Fragile parsing**: yamllint/flake8/markdownlint
   output parsed via `sed`; format changes break it
@@ -390,9 +408,19 @@ graph TB
   suite for hook performance under load
 - **`.claude/tests/hooks/`**: Integration test suite
   infrastructure (103 tests across 3 agents, JSONL results)
+  plus diagnostic scripts (see Testing & Quality)
 - **`docs/specs/adr-*.md`**: Architecture Decision Records
   (hook schema, package manager enforcement, CLI tool
-  prefs, TS expansion, hook integration testing)
+  prefs, TS expansion, hook integration testing,
+  versioning + CC compatibility)
+- **`docs/specs/posttooluse-issue/make-plankton-work.md`**:
+  Executable plan that identified and fixed the
+  `rerun_phase2()` garbled-output bug in `multi_linter.sh`;
+  also confirmed PostToolUse delivery mechanism via mitmproxy
+- **`docs/specs/posttooluse-issue/posttoolusewrite-hook-stderr-silent-drop.md`**:
+  Root cause investigation of PostToolUse silent drop hypothesis
+- **`docs/specs/posttooluse-issue/cc-trace/`**: mitmproxy
+  trace scripts and JSONL evidence used in investigation
 - **`docs/specs/stress-test-report.md`**: Results from hook
   stress testing
 - **`docs/specs/portable-hooks-template.md`**: Template

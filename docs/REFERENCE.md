@@ -740,6 +740,27 @@ See [Testing Guide](tests/README.md#self-test-suite) for the full test catalog.
 ~/.claude/debug/
 ```
 
+## Investigation Principles
+
+When debugging hook behavior or unexpected agent responses:
+
+1. **Verify the actual problem before implementing workarounds.**
+   Test whether the existing mechanism works under controlled
+   conditions before building alternatives. A clean reproduction
+   test is faster than a workaround and may reveal the problem
+   is elsewhere.
+2. **Rank evidence sources.** Higher-ranked evidence overrides
+   lower: mitmproxy API capture (definitive) > controlled
+   reproduction > source code reading > JSONL forensics
+   (incomplete) > terminal observation > GitHub issues
+   (unreviewed).
+3. **Test before you gate.** If a delivery mechanism appears
+   broken, run a controlled test with clean output before
+   adding gates or workarounds.
+
+See `docs/specs/posttooluse-issue/make-plankton-work.md`
+(Evidence Hierarchy table) for the full ranked matrix.
+
 ## Testing Hooks Manually
 
 See [Testing Guide](tests/README.md#testing-hooks-manually) for manual testing
@@ -1685,9 +1706,10 @@ test layers, execution instructions, and known limitations.
 Claude Code v2.1.50 does NOT propagate PostToolUse hook output into
 the `tool_result` field. The tool_result contains only the Write/Edit
 success message. However, mitmproxy capture proved that stderr+exit2
-IS delivered to the model as a `<system-reminder>` text block adjacent
-to the tool_result in the same API message. The model CAN read this
-content (confirmed: haiku's thinking referenced hook error text).
+IS delivered to the model as a `<system-reminder>` tag embedded inside
+the `tool_result.content` string (not as a separate content block).
+The model CAN read and act on this content (confirmed: opus-4-6
+thinking referenced hook violation codes in 3/3 mitmproxy iterations).
 
 Whether the agent reliably ACTS on this ambient system-reminder
 feedback (vs structured tool feedback) is under investigation. A

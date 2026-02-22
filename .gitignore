@@ -53,8 +53,7 @@ coverage/
 # Publication hygiene — internal / private files
 assets/internal/
 docs/internal/
-docs/specs/linear-issue-hook-messages.md
-docs/specs/stress-test-report.md
+docs/specs/
 PLAN.md
 CLAUDE.md
 !/CLAUDE.md

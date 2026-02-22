@@ -362,7 +362,7 @@ Do not add comments explaining fixes. Do not refactor beyond what's needed."
 
   if [[ -z "${claude_cmd}" ]]; then
     echo "[hook:error] claude binary not found, cannot delegate" >&2
-    return 1
+    return 0
   fi
 
 
@@ -728,6 +728,7 @@ _biome_relpath() {
 handle_typescript() {
   local fp="$1"
   local ext="${fp##*.}"
+  local _merged
 
   # Detect Biome
   local biome_cmd
@@ -807,8 +808,9 @@ handle_typescript() {
         }]' 2>/dev/null) || biome_violations="[]"
 
       if [[ "${biome_violations}" != "[]" ]] && [[ -n "${biome_violations}" ]]; then
-        collected_violations=$(echo "${collected_violations}" "${biome_violations}" \
-          | jaq -s '.[0] + .[1]')
+        _merged=$(echo "${collected_violations}" "${biome_violations}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
         has_issues=true
       fi
 
@@ -868,10 +870,20 @@ case "${file_path}" in
     # Note: No --select override - pyproject.toml is single source of truth
     ruff_violations=$(ruff check --preview --output-format=json "${file_path}" 2>/dev/null || true)
     if [[ -n "${ruff_violations}" ]] && [[ "${ruff_violations}" != "[]" ]]; then
-      # Add linter tag and merge into collected_violations
-      collected_violations=$(echo "${collected_violations}" "${ruff_violations}" \
-        | jaq -s '.[0] + (.[1] | map(. + {linter: "ruff"}))')
-      has_issues=true
+      # Convert raw ruff JSON to unified {line,column,code,message,linter} schema
+      ruff_converted=$(echo "${ruff_violations}" | jaq '[.[] | {
+        line: .location.row,
+        column: .location.column,
+        code: .code,
+        message: .message,
+        linter: "ruff"
+      }]' 2>/dev/null) || ruff_converted="[]"
+      if [[ -n "${ruff_converted}" ]] && [[ "${ruff_converted}" != "[]" ]]; then
+        _merged=$(echo "${collected_violations}" "${ruff_converted}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        has_issues=true
+      fi
     fi
 
     # Python: Phase 2b - Type checking with ty (complementary to ruff)
@@ -889,9 +901,10 @@ case "${file_path}" in
           code: .check_name,
           message: .description,
           linter: "ty"
-        }]')
-        collected_violations=$(echo "${collected_violations}" "${ty_converted}" \
-          | jaq -s '.[0] + .[1]')
+        }]' 2>/dev/null) || ty_converted="[]"
+        _merged=$(echo "${collected_violations}" "${ty_converted}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
         has_issues=true
       fi
     fi
@@ -944,8 +957,11 @@ case "${file_path}" in
           jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \
             '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-pydantic"}'
         done | jaq -s '.')
-        [[ -n "${pyd_json}" ]] && collected_violations=$(echo "${collected_violations}" "${pyd_json}" \
-          | jaq -s '.[0] + .[1]')
+        if [[ -n "${pyd_json}" ]]; then
+          _merged=$(echo "${collected_violations}" "${pyd_json}" \
+            | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -968,9 +984,11 @@ case "${file_path}" in
           jaq -n --arg l "${line_num}" --arg m "${msg}" \
             '{line:($l|tonumber),column:1,code:"VULTURE",message:$m,linter:"vulture"}'
         done | jaq -s '.')
-        [[ -n "${vulture_json}" ]] && [[ "${vulture_json}" != "[]" ]] && \
-          collected_violations=$(echo "${collected_violations}" "${vulture_json}" \
-            | jaq -s '.[0] + .[1]')
+        if [[ -n "${vulture_json}" ]] && [[ "${vulture_json}" != "[]" ]]; then
+          _merged=$(echo "${collected_violations}" "${vulture_json}" \
+            | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -993,10 +1011,12 @@ case "${file_path}" in
           code: .test_id,
           message: .issue_text,
           linter: "bandit"
-        }]')
-        [[ -n "${bandit_converted}" ]] && [[ "${bandit_converted}" != "[]" ]] && \
-          collected_violations=$(echo "${collected_violations}" "${bandit_converted}" \
-            | jaq -s '.[0] + .[1]')
+        }]' 2>/dev/null) || bandit_converted="[]"
+        if [[ -n "${bandit_converted}" ]] && [[ "${bandit_converted}" != "[]" ]]; then
+          _merged=$(echo "${collected_violations}" "${bandit_converted}" \
+            | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -1016,8 +1036,11 @@ case "${file_path}" in
             --arg m "${msg}" \
             '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"flake8-async"}'
         done | jaq -s '.')
-        [[ -n "${async_json}" ]] && collected_violations=$(echo "${collected_violations}" \
-          "${async_json}" | jaq -s '.[0] + .[1]')
+        if [[ -n "${async_json}" ]]; then
+          _merged=$(echo "${collected_violations}" \
+            "${async_json}" | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -1044,9 +1067,10 @@ case "${file_path}" in
           code: ("SC" + (.code | tostring)),
           message: .message,
           linter: "shellcheck"
-        }]')
-        collected_violations=$(echo "${collected_violations}" "${sc_converted}" \
-          | jaq -s '.[0] + .[1]')
+        }]' 2>/dev/null) || sc_converted="[]"
+        _merged=$(echo "${collected_violations}" "${sc_converted}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
         has_issues=true
       fi
     fi
@@ -1069,8 +1093,11 @@ case "${file_path}" in
           jaq -n --arg l "${line_num}" --arg c "${col_num}" --arg cd "${code}" --arg m "${msg}" \
             '{line:($l|tonumber),column:($c|tonumber),code:$cd,message:$m,linter:"yamllint"}'
         done | jaq -s '.')
-        [[ -n "${yaml_json}" ]] && collected_violations=$(echo "${collected_violations}" "${yaml_json}" \
-          | jaq -s '.[0] + .[1]')
+        if [[ -n "${yaml_json}" ]]; then
+          _merged=$(echo "${collected_violations}" "${yaml_json}" \
+            | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -1086,8 +1113,9 @@ case "${file_path}" in
       # shellcheck disable=SC2016 # $m is a jaq variable, not shell
       json_violation=$(jaq -n --arg m "${json_error}" \
         '[{line:1,column:1,code:"JSON_SYNTAX",message:$m,linter:"jaq"}]')
-      collected_violations=$(echo "${collected_violations}" "${json_violation}" \
-        | jaq -s '.[0] + .[1]')
+      _merged=$(echo "${collected_violations}" "${json_violation}" \
+        | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+      [[ -n "${_merged}" ]] && collected_violations="${_merged}"
       has_issues=true
     else
       # JSON: Phase 2 - Auto-format valid JSON
@@ -1140,9 +1168,10 @@ case "${file_path}" in
           code: .code,
           message: .message,
           linter: "hadolint"
-        }]')
-        collected_violations=$(echo "${collected_violations}" "${hl_converted}" \
-          | jaq -s '.[0] + .[1]')
+        }]' 2>/dev/null) || hl_converted="[]"
+        _merged=$(echo "${collected_violations}" "${hl_converted}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
         has_issues=true
       fi
     fi
@@ -1167,8 +1196,9 @@ case "${file_path}" in
         # shellcheck disable=SC2016
         toml_violation=$(jaq -n --arg m "${taplo_check}" \
           '[{line:1,column:1,code:"TOML_SYNTAX",message:$m,linter:"taplo"}]')
-        collected_violations=$(echo "${collected_violations}" "${toml_violation}" \
-          | jaq -s '.[0] + .[1]')
+        _merged=$(echo "${collected_violations}" "${toml_violation}" \
+          | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+        [[ -n "${_merged}" ]] && collected_violations="${_merged}"
         has_issues=true
       fi
     fi
@@ -1200,11 +1230,6 @@ case "${file_path}" in
       violation_count=$(echo "${markdownlint_output}" | grep -cE "^[^:]+:[0-9]+" || true)
       [[ -z "${violation_count}" ]] && violation_count=0
 
-      # Brief summary output - only if violations remain after auto-fix
-      if [[ "${violation_count}" -gt 0 ]]; then
-        echo >&2 "[hook] Markdown: ${violation_count} unfixable issue(s) collected"
-      fi
-
       # Only collect if there are actual errors
       if [[ -n "${markdownlint_output}" ]] && ! echo "${markdownlint_output}" | grep -q "Summary: 0 error"; then
         # Convert markdownlint output to JSON (file:line:col MD### message)
@@ -1216,9 +1241,11 @@ case "${file_path}" in
           jaq -n --arg l "${line_num}" --arg cd "${code}" --arg m "${msg}" \
             '{line:($l|tonumber),column:1,code:$cd,message:$m,linter:"markdownlint"}'
         done | jaq -s '.')
-        [[ -n "${md_json}" ]] && [[ "${md_json}" != "[]" ]] \
-          && collected_violations=$(echo "${collected_violations}" "${md_json}" \
-            | jaq -s '.[0] + .[1]')
+        if [[ -n "${md_json}" ]] && [[ "${md_json}" != "[]" ]]; then
+          _merged=$(echo "${collected_violations}" "${md_json}" \
+            | jaq -s '.[0] + .[1]' 2>/dev/null) || _merged=""
+          [[ -n "${_merged}" ]] && collected_violations="${_merged}"
+        fi
         has_issues=true
       fi
     fi
@@ -1266,6 +1293,10 @@ fi
 # Testing mode: skip subprocess and report violations directly
 # Usage: HOOK_SKIP_SUBPROCESS=1 ./multi_linter.sh
 if [[ "${HOOK_SKIP_SUBPROCESS:-}" == "1" ]]; then
+  skip_count=$(echo "${collected_violations}" | jaq 'length' 2>/dev/null || echo "0")
+  if [[ "${skip_count}" -eq 0 ]]; then
+    exit 0
+  fi
   echo "[hook] ${collected_violations}" >&2
   exit 2
 fi
@@ -1282,6 +1313,7 @@ remaining=$(rerun_phase2 "${file_path}" "${file_type}" | tail -1)
 if [[ "${remaining}" -eq 0 ]]; then
   exit 0 # Fixed successfully
 else
+  echo "[hook:feedback-loop] delivered ${remaining} violations for ${file_path}" >&2
   echo "[hook] ${remaining} violation(s) remain after delegation" >&2
   exit 2
 fi

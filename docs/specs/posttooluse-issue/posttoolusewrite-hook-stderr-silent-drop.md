@@ -1,36 +1,62 @@
-# PostToolUse Hook Output: Delivery via system-reminder, Not tool_result
+# PostToolUse Hook Output: Delivery via system-reminder Inside tool_result
 
 Investigation into how Claude Code delivers PostToolUse command hook
-output. The `tool_result` field never contains hook feedback, but
-stderr+exit2 output IS delivered to the model as a `<system-reminder>`
-text block adjacent to the tool_result in the same API message.
+output. Stderr+exit2 output IS delivered to the model as a
+`<system-reminder>` tag embedded inside the `tool_result.content` string
+(not as a separate content block — see Correction Notice 2026-02-22).
 
 **Affected version**: Claude Code v2.1.50
 **Discovered**: 2026-02-21
-**Corrected**: 2026-02-21 (mitmproxy verification)
+**Corrected**: 2026-02-21 (mitmproxy verification),
+2026-02-22 (delivery mechanism correction — see Correction Notice below)
 **Session**: `4caaa728-f9e5-4cf2-94b5-f22d0f1a0f6a`
 **Document status**: Historical record. The active executable plan is
-`make-plankton-work.md`. This document preserves investigation details,
-evidence chains, and workaround designs for reference.
+`make-plankton-work.md` (now COMPLETE). This document preserves
+investigation details, evidence chains, and workaround designs for
+reference.
+
+## Correction Notice (2026-02-22)
+
+The 2026-02-21 correction described the delivery mechanism as "a separate
+`<system-reminder>` text block appended to the same user message as the
+tool_result." **This was imprecise.** Live verification with mitmproxy
+(3 iterations across shell, Python, and JSON) shows the `<system-reminder>`
+is embedded **inside the `tool_result.content` string itself**, not as a
+separate content block in the messages array. The tool_result content field
+contains the success message followed by `\n\n<system-reminder>...\n\n</system-reminder>`.
+
+This distinction matters: the JSONL forensics conclusion that "tool_result
+contains ONLY the success message" was wrong — the tool_result content
+includes both the success message and the system-reminder tag. The search
+missed this because it looked for hook output as primary content rather
+than searching for `<system-reminder>` tags within the content string.
+
+Evidence: `make-plankton-work.md` Step 2 Live Verification Report
+(mitmproxy rank-1, 3/3 iterations).
 
 ## Correction Notice (2026-02-21)
 
 The original investigation concluded that PostToolUse hook output was
 "unconditionally discarded." **This was wrong.** Mitmproxy capture of
 the actual API request body proved that stderr+exit2 output IS delivered
-to the model as a `<system-reminder>` text block appended to the same
-user message as the tool_result. The JSONL forensics missed this because
-JSONL only records tool_result content, not adjacent text blocks. The
-GitHub issues referenced below describe the tool_result field behavior
-accurately but do not account for the system-reminder delivery channel.
+to the model as a `<system-reminder>` tag embedded inside the
+`tool_result.content` string (corrected 2026-02-22 — originally described
+as a separate adjacent text block; see Correction Notice 2026-02-22 above).
+The JSONL forensics missed this because the search looked for raw hook
+output as primary content, not for `<system-reminder>` tags within the
+content string. The GitHub issues referenced below describe the tool_result
+field behavior accurately but do not account for the system-reminder
+delivery channel.
 
-**What is true** (hard evidence — mitmproxy capture):
+**What is true** (hard evidence — mitmproxy capture, updated 2026-02-22):
 
-- The `tool_result` field contains ONLY the Write/Edit success message
-- Hook stderr IS delivered as a separate `<system-reminder>` text block
-  in the same API message
-- The model CAN read this text block (confirmed: haiku's thinking
-  referenced "3 violations remain" from the system-reminder)
+- The `tool_result.content` string contains both the success message AND
+  the `<system-reminder>` tag with hook stderr (not a separate text block)
+- The model CAN read the system-reminder content (confirmed: opus-4-6
+  thinking referenced specific violation codes from the hook JSON and
+  explicitly said "hook flagged" in 3/3 iterations)
+- The agent reliably ACTS on the feedback: Read + Edit calls in all
+  3 test iterations (shell SC2034, Python F841, JSON JSON_SYNTAX)
 
 **What was wrong** (claims corrected):
 
@@ -40,37 +66,40 @@ accurately but do not account for the system-reminder delivery channel.
 - "Agent had zero signal" — wrong; the signal arrives as ambient
   context, not structured tool feedback
 
-**What remains unclear** (updated 2026-02-21):
+**What remains unclear** (updated 2026-02-22):
 
 - Whether the agent reliably ACTS on system-reminder hook feedback
-  — *Partially answered*: unverified terminal observations (rank 5)
-  show Python (14 remain), TypeScript (5 remain), and Shell (156
-  remain) all triggering agent responses consistent with acting on the
-  system-reminder. Not hard evidence. See `make-plankton-work.md`
-  "Unverified Terminal Observations" section.
+  — **RESOLVED (2026-02-22)**: YES. Live verification with mitmproxy
+  confirms 3/3 iterations: shell (SC2034), Python (F841), JSON
+  (JSON_SYNTAX). Agent explicitly references hook output and makes
+  Edit calls. See `make-plankton-work.md` Step 2 Live Verification
+  Report.
 - Whether multi_linter.sh's garbled output (Step 1 bug) was the real
   reason the agent ignored violations in the original session
-  — *Strongly suggested by code review*: the `|| echo "[]"` bug in
-  `rerun_phase2()` was systemic across ALL file types (7 handlers).
-  Structural evidence (from code), not observational. See
-  `make-plankton-work.md` "Code Review: Bug Was Systemic" section.
+  — **RESOLVED (2026-02-22)**: YES. Fixing the garbled output (Step 1)
+  and protecting jaq calls (Step 1.5) was sufficient. No CC behavior
+  issue — the delivery mechanism works when the hook produces clean
+  output.
 - Whether the other 4 output channels also produce system-reminder
-  blocks (only stderr+exit2 was mitmproxy-tested) — *Still unknown*
+  blocks (only stderr+exit2 was mitmproxy-tested) — *Still unknown*.
+  Automated channel output tests pass (20/20), mitmproxy runbook ready
+  in `test_five_channels.sh --runbook`.
 
 Evidence: `cc-trace/verification-report.md` (mitmproxy capture Phase 2B)
 
 ## Summary
 
-Claude Code v2.1.50 does NOT propagate PostToolUse hook output into the
-`tool_result` field. The tool_result contains only the Write/Edit
-success message. However, for stderr+exit2, the hook's stderr content IS
-delivered to the model as a `<system-reminder>` text block adjacent to
-the tool_result in the same API user message.
+Claude Code v2.1.50 does NOT propagate PostToolUse hook output into a
+separate `tool_result` field. However, for stderr+exit2, the hook's
+stderr content IS delivered to the model as a `<system-reminder>` tag
+embedded inside the `tool_result.content` string — the content field
+contains both the success message and the system-reminder tag
+(corrected 2026-02-22; see Correction Notice above).
 
-This means the model receives the hook feedback as ambient context rather
-than structured tool feedback associated with the specific tool call.
-Whether the agent reliably acts on this ambient feedback — especially
-when the content is garbled (see Secondary Bug below) — is untested.
+The agent reliably acts on this feedback when the hook output is clean
+(confirmed 3/3 iterations with mitmproxy rank-1 evidence — see
+`make-plankton-work.md` Step 2 Live Verification Report). Garbled
+output (pre-Step-1-fix) was ignored by the agent.
 
 The terminal UI renders `PostToolUse:Write hook error` as a progress
 indicator. Unlike what was originally claimed, this is NOT purely
@@ -170,23 +199,27 @@ only the Write tool's native output. No hook stderr was appended.
 
 ### Corrected Hypothesis: tool_result Empty, system-reminder Delivers
 
-The PostToolUse result handler does NOT propagate hook output into the
-`tool_result` field. The tool_result contains only the Write/Edit
-native success message. However, mitmproxy capture (2026-02-21) proved
-that stderr+exit2 content IS delivered to the model as a separate
-`<system-reminder>` text block in the same API message:
+The PostToolUse result handler does NOT propagate hook output as a
+separate content block. However, mitmproxy capture proved that
+stderr+exit2 content IS delivered to the model as a `<system-reminder>`
+tag embedded inside the `tool_result.content` string:
 
-```text
-MSG[2] role=user content=list(2 blocks)
-  [0] tool_result is_error=ABSENT
-      content: File created successfully at: /tmp/verify-stderr-exit2-v2.txt
-  [1] text (409 chars):
-      <system-reminder>
-      PostToolUse:Write hook blocking error from command:
-      ".../hook-stderr-exit2.sh": [...]: [hook] 3 violation(s)
-      remain after delegation
-      </system-reminder>
+```json
+{
+  "type": "tool_result",
+  "content": "The file ...updated successfully.\n\n<system-reminder>\nPostToolUse:Write hook blocking error from command: \".claude/hooks/multi_linter.sh\": [hook] [\n  {\"line\": 2, \"code\": \"SC2034\", ...}\n]\n\n</system-reminder>",
+  "tool_use_id": "toolu_..."
+}
 ```
+
+**Note**: The 2026-02-21 mitmproxy capture (`claude -p` mode, haiku)
+originally showed this as `MSG[2] content=list(2 blocks)` — a separate
+text block adjacent to the tool_result. The 2026-02-22 capture
+(interactive mode, opus) corrected this: the system-reminder is inside
+`tool_result.content`, not a separate block. Whether this reflects a
+mode-dependent difference (`-p` vs interactive) or a 2026-02-21
+analysis error has not been independently verified. The interactive-mode
+finding is authoritative for production.
 
 Evidence trail for tool_result being empty:
 
@@ -457,38 +490,8 @@ code was not incorporated into it.
 
 ## Additional Evidence: Edit vs Write Behavior Difference
 
-> **DISPROVED** by Investigation 1 (2026-02-21). Controlled testing
-> showed both Edit and Write drop hook output identically. The apparent
-> asymmetry below was caused by the agent inferring violations from
-> CLAUDE.md's Boy Scout Rule, not from actual hook output reaching the
-> tool_result. See "High Priority — COMPLETED" section for details.
-
-In the **same session** (`4caaa728`), the agent later performed an Edit
-on the same file (`fix-setapp.sh`). The agent appeared to react to the
-hook error — but Investigation 1 proved this was CLAUDE.md-driven
-inference, not actual hook output delivery.
-
-### What the agent saw (Edit case)
-
-```text
-Update(/Users/alex/Documents/cc-inbox/setapp/fix-setapp.sh)
-  Added 31 lines, removed 6 lines
-  PostToolUse:Edit hook returned blocking error
-  [.claude/hooks/multi_linter.sh]: .claude/hooks/multi_linter.sh: line 1282: [[:
-     56
-     0: syntax error in expression (error token is "0")
-     [hook] 56
-     0 violation(s) remain after delegation
-```
-
-Original comparison (preserved for historical context, now disproved):
-
-| Aspect | Write (L42) | Edit (later) |
-| --- | --- | --- |
-| Terminal message | `hook error` | `hook returned blocking error` |
-| Agent received error | No | Appeared to, via CLAUDE.md inference |
-| Error format | N/A (dropped) | Bash syntax error + violation count |
-| Agent response | "No hold up" | "Internal hook bug, not my file" |
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ## Secondary Bug: Multi-Line Violation Count
 
@@ -498,12 +501,12 @@ Original comparison (preserved for historical context, now disproved):
 > independently. See Step 1 in Action Plan.
 
 The Edit error above reveals a bug in `rerun_phase2()`: the `remaining`
-variable captured on line 1280 contained `56\n0` (two numbers separated
+variable captured on line 1307 contained `56\n0` (two numbers separated
 by a newline) instead of a single integer. This caused:
 
-1. **Bash syntax error on line 1282**: `[[ "56\n0" -eq 0 ]]` fails
+1. **Bash syntax error on line 1309**: `[[ "56\n0" -eq 0 ]]` fails
    because bash cannot evaluate a multi-line string as an integer
-2. **Garbled error message on line 1285**: `[hook] 56\n0 violation(s)
+2. **Garbled error message on line 1312**: `[hook] 56\n0 violation(s)
    remain after delegation` — the count is unreadable
 
 The `rerun_phase2()` function (line 494-617) initializes `count=0` and
@@ -606,11 +609,11 @@ The hook communicates with Claude Code through two channels:
 
 ### Channel 2: Stderr (`>&2`)
 
-- `[hook] N violation(s) remain after delegation` (exit 2, line 1285)
+- `[hook] N violation(s) remain after delegation` (exit 2, line 1312)
 - `[hook:warning] subprocess timed out (exit 124)` (line 414)
 - `[hook:warning] subprocess failed (exit N)` (line 416)
 - `[hook:advisory] ...` (exit 0, informational messages)
-- `[hook:model] opus|sonnet` (debug mode, line 1263)
+- `[hook:model] opus|sonnet` (debug mode, line 1290)
 
 **What Claude Code should do** (per `docs/REFERENCE.md` lines 479-484):
 
@@ -619,14 +622,15 @@ The hook communicates with Claude Code through two channels:
   the agent can act on remaining violations per CLAUDE.md's Boy Scout
   Rule
 
-**What Claude Code actually does** (corrected by mitmproxy):
+**What Claude Code actually does** (corrected by mitmproxy, updated
+2026-02-22):
 
 - Exit 0: Correct — no annotation
-- Exit 2 + stderr: **Not in tool_result**, but IS delivered as a
-  `<system-reminder>` text block in the same API message (mitmproxy
-  evidence). The agent receives it as ambient context, not structured
-  tool feedback. Pre-Step-1-fix, the garbled output was ignored by the
-  agent; post-fix, terminal observations suggest the agent acts on it.
+- Exit 2 + stderr: Delivered as a `<system-reminder>` tag embedded
+  inside `tool_result.content` (not a separate content block —
+  corrected 2026-02-22). The agent reliably acts on clean feedback
+  (3/3 mitmproxy-verified iterations). Pre-Step-1-fix garbled output
+  was ignored; post-fix, the feedback loop works.
 
 ### Affected Output Paths in multi_linter.sh
 
@@ -643,11 +647,13 @@ delivered via `<system-reminder>` for exit 2 (mitmproxy-verified):
 | 1263 | `[hook:model] ${debug_model}` | Debug model selection |
 
 Cross-session JSONL analysis found: **No PostToolUse hook stderr in any
-tool_result field across all plankton sessions**. However, the JSONL
-format does not capture `<system-reminder>` text blocks adjacent to
-tool_results. Mitmproxy evidence (2026-02-21) proves stderr+exit2
-IS delivered via system-reminder. The JSONL finding is accurate for
-tool_result but incomplete for overall model visibility.
+tool_result field across all plankton sessions** when searching for raw
+hook output as primary content. The 2026-02-22 mitmproxy finding shows
+the system-reminder is embedded inside `tool_result.content` — whether
+JSONL captures this (CC appends before logging) or omits it (CC appends
+during API request assembly) has not been independently verified by
+re-examining JSONL from a post-Step-1 session. See `make-plankton-work.md`
+Evidence Hierarchy footnote [†].
 
 ### Exit 0 Stderr: Delivery Status Unknown
 
@@ -675,263 +681,33 @@ sufficient for reliable agent action.
 
 ### Strategy 1: JSON Output to Stdout — NOT IN tool_result
 
-**Hypothesis**: The JSON-first code path (`output starts with {`) may
-propagate the output to the tool_result field.
-
-**Test result**: **Not in tool_result.** Tested 2026-02-21 with a
-minimal hook that writes JSON to stdout and exits 2:
-
-```bash
-#!/bin/bash
-echo "hook-ran-at-$(date +%s)" > /tmp/test-hook-marker.txt
-echo '{"hookResult":"error","message":"[hook] 3 violation(s) remain"}'
-exit 2
-```
-
-Registered as PostToolUse:Write, run via `claude -p` (haiku, v2.1.50).
-Results:
-
-- **Hook executed**: Confirmed (marker file created with timestamp)
-- **JSON stdout in tool_result**: **No.** The tool_result contained
-  only `"File created successfully at: /tmp/test-hook-output.txt"`
-- **No `is_error` field**: Absent from tool_result
-- **Whether JSON stdout produces a system-reminder**: **UNTESTED** —
-  only stderr+exit2 was verified via mitmproxy
-
-tool_result is empty across all tested channels:
-
-| Channel | Exit | In tool_result? | system-reminder? |
-| --- | --- | --- | --- |
-| Plain text stderr | 2 | NO | **YES** (mitmproxy) |
-| Plain text stderr | 0 | NO | Untested |
-| JSON stdout | 2 | NO | Untested |
-| JSON PreToolUse schema | 0 | NO (inconclusive) | Untested |
-
-**Conclusion**: No PostToolUse output channel populates tool_result.
-However, stderr+exit2 IS delivered via system-reminder text block
-(mitmproxy evidence). Whether the other channels also produce
-system-reminder blocks requires additional mitmproxy testing.
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Strategy 2: Sidecar Violation File + CLAUDE.md Instruction — RECOMMENDED
 
-**Status**: Best available workaround. Completely bypasses the broken
-hook output parser by writing to a file and using CLAUDE.md (a channel
-provably loaded into every API request) to instruct the agent.
-
-**Sidecar file location**: `.claude/.violations.json` (gitignored).
-
-Rationale for location and format:
-
-- **`.claude/` directory**: Already exists in every plankton project,
-  already contains transient state (plans, tmp). No new directory
-  needed.
-- **JSON format**: Structured data is easier for the agent to parse
-  than plain text. Includes file path, violation count, and timestamp.
-- **Gitignored**: This is transient state (created by hook, deleted by
-  agent). Add `.claude/.violations.json` to `.gitignore`.
-- **Single file, atomic write**: Overwritten on each hook invocation.
-  If multiple edits happen before the agent checks, only the latest
-  violations are shown — acceptable because the agent will re-trigger
-  the hook when it fixes the file.
-
-**Implementation**:
-
-```bash
-# In multi_linter.sh, on exit 2:
-violation_file="${CLAUDE_PROJECT_DIR:-.}/.claude/.violations.json"
-jaq -n \
-  --arg f "${file_path}" \
-  --arg c "${remaining}" \
-  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{file:$f, count:($c|tonumber), timestamp:$t}' \
-  > "${violation_file}"
-exit 2
-
-# In multi_linter.sh, on exit 0 (clean up stale sidecar):
-violation_file="${CLAUDE_PROJECT_DIR:-.}/.claude/.violations.json"
-rm -f "${violation_file}"
-exit 0
-```
-
-```markdown
-# In CLAUDE.md, add:
-## Post-Write Violation Check
-After every Edit or Write, check if `.claude/.violations.json` exists.
-If it does, read it — it contains violations the hook could not
-auto-fix. Fix all listed violations in the reported file, then delete
-`.claude/.violations.json`.
-```
-
-**Advantages**:
-
-- Fully independent of Claude Code's hook output parser
-- Works regardless of hook exit code
-- The sidecar file persists across turns
-- CLAUDE.md instructions are reliably loaded into every API request
-- JSON format is unambiguous for the agent
-- Atomic write prevents partial reads
-- Clean exit (0) removes stale sidecar — no stale file accumulation
-
-**Disadvantages**:
-
-- Requires the agent to proactively check (adds a Read tool call)
-- Race condition if multiple edits happen before agent checks (mitigated
-  by atomic overwrite — agent sees latest violations only)
-- The agent may not check consistently despite CLAUDE.md instruction
-  (mitigated by placing the instruction prominently in CLAUDE.md)
-- Adds file I/O overhead to every hook invocation (negligible — single
-  JSON write/delete)
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Strategy 3: Embed Marker Comment in Edited File
 
-**Implementation**: When violations remain, append a structured comment
-to the file itself. The agent will see the comment on subsequent reads.
-
-```bash
-# In multi_linter.sh, on exit 2:
-marker="# [HOOK-VIOLATIONS] ${remaining} violation(s) remain — fix before commit"
-if ! grep -q '\[HOOK-VIOLATIONS\]' "${file_path}"; then
-  echo "" >> "${file_path}"
-  echo "${marker}" >> "${file_path}"
-fi
-exit 2
-```
-
-**Advantages**:
-
-- Zero dependency on Claude Code's hook output parser
-- Agent will see the marker when it reads the file
-- Linters may flag the marker as an issue (reinforcing visibility)
-- **Unique strength**: This is the only strategy that makes violations
-  visible during a Read operation without any hook system involvement.
-  If the agent reads the file for any reason (not just editing), it
-  sees the marker. No other strategy provides this passive visibility.
-
-**Disadvantages**:
-
-- Modifies the user's file with non-functional content
-- May cause linter violations itself (trailing comment)
-- Must be cleaned up after violations are fixed
-- Interacts poorly with git (marker appears in diffs)
-- Does not work well for JSON, YAML, or other non-comment formats
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Strategy 4: PreToolUse Gate with Enriched Lock Files — RECOMMENDED
 
-**Implementation**: Have the PostToolUse hook write a "violation lock"
-file containing violation details. Add a PreToolUse hook that blocks
-the next Edit/Write on the same file until violations are resolved,
-including the violation details in the block message.
-
-```bash
-# In multi_linter.sh PostToolUse, on exit 2:
-lock_dir="${CLAUDE_PROJECT_DIR:-.}/.claude/violation-locks"
-mkdir -p "${lock_dir}"
-lock_hash="$(echo "${file_path}" | shasum -a 256 | cut -c1-16)"
-jaq -n \
-  --arg f "${file_path}" \
-  --arg c "${remaining}" \
-  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{file:$f, count:($c|tonumber), timestamp:$t}' \
-  > "${lock_dir}/${lock_hash}"
-exit 2
-
-# In multi_linter.sh PostToolUse, on exit 0 (clean up lock):
-lock_hash="$(echo "${file_path}" | shasum -a 256 | cut -c1-16)"
-rm -f "${lock_dir}/${lock_hash}"
-exit 0
-
-# In PreToolUse hook:
-lock_dir="${CLAUDE_PROJECT_DIR:-.}/.claude/violation-locks"
-lock_hash="$(echo "${file_path}" | shasum -a 256 | cut -c1-16)"
-lock_file="${lock_dir}/${lock_hash}"
-if [[ -f "${lock_file}" ]]; then
-  count=$(jaq -r '.count' < "${lock_file}" 2>/dev/null || echo "unknown")
-  target=$(jaq -r '.file' < "${lock_file}" 2>/dev/null || echo "${file_path}")
-  # Note: message explicitly says violations are in the FILE, not the hook
-  # (prevents Layer 3 misinterpretation — see Agent Misinterpretation section)
-  reason="[hook] ${target} has ${count} unresolved linting violations. Fix ALL violations in this file before editing it again. The violations are in YOUR file, not in the hook."
-  echo "{\"decision\":\"block\",\"reason\":\"${reason}\"}"
-  exit 0
-fi
-```
-
-**Advantages**:
-
-- PreToolUse hooks DO reliably communicate with the agent (JSON output
-  is parsed correctly)
-- Forces the agent to address violations before proceeding
-- Uses Claude Code's existing, working PreToolUse infrastructure
-- Lock files carry violation details — no separate sidecar file needed
-- Block message includes file path and violation count (not generic)
-- Block message explicitly attributes violations to the file, not the
-  hook (prevents Agent Misinterpretation Layer 3)
-- Per-file locks support multiple files with violations simultaneously
-- No dependency on CLAUDE.md compliance (deterministic enforcement)
-
-**Disadvantages**:
-
-- Blocks subsequent edits entirely (may be too aggressive)
-- Requires coordination between two hook scripts
-- Lock file management adds complexity (stale locks, cleanup)
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Recommended Approach (Pre-Mitmproxy Assessment)
 
-> **NOTE**: This recommendation was made before the mitmproxy finding
-> that stderr+exit2 IS delivered via system-reminder. The corrected plan
-> in `make-plankton-work.md` downgrades Strategy 4 to **last resort**
-> (Option C) — only needed if the system-reminder channel is confirmed
-> insufficient. Terminal observations (rank 5) suggest the system-reminder
-> channel may be sufficient when hook output is clean (post-Step-1-fix).
-
-**Strategy 4 (PreToolUse gate with enriched lock files)** was the
-recommended workaround before the system-reminder delivery was discovered. It provides both enforcement AND information
-through a single proven channel:
-
-- **Enforcement**: Blocks the next edit to the same file until
-  violations are resolved. Uses PreToolUse JSON output, which IS
-  reliably parsed. Deterministic — does not depend on CLAUDE.md
-  compliance, which is probabilistic and degrades under context
-  pressure.
-
-- **Information**: The enriched lock file carries file path, violation
-  count, and timestamp. The PreToolUse block message includes these
-  details so the agent knows WHAT to fix, not just that something is
-  wrong.
-
-- **Misinterpretation prevention**: The block message explicitly
-  attributes violations to the target file (not the hook), informed
-  by the Agent Misinterpretation analysis (Layer 3).
-
-Strategy 2 (sidecar file) was previously considered as a complement
-but has fundamental issues: single-file atomic overwrite loses
-multi-file violation data, requires probabilistic CLAUDE.md compliance,
-and introduces desync risk between sidecar and lock files. With
-enriched lock files carrying violation details, Strategy 2 is
-redundant. It remains documented above as a historical alternative.
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Failure Modes
 
-| Failure mode | Impact | Mitigation |
-| ------------ | ------ | ---------- |
-| Stale lock after crash | Agent blocked | SessionStart: clean lock dir |
-| Lock corruption (JSON) | Details unreadable | Treat as "violations exist" |
-| Concurrent sessions | A clears B's locks | Acceptable; document limit |
-| Violations fixed, lock stale | Blocked needlessly | Delete lock manually |
-| Stale lock in PreToolUse | Outdated count | Advisory; PostToolUse updates |
-
-### Stale Lock Cleanup
-
-Add a SessionStart hook that clears all violation lock files:
-
-```bash
-# SessionStart hook (runs once at session start)
-rm -rf "${CLAUDE_PROJECT_DIR:-.}/.claude/violation-locks"
-```
-
-Rationale: New session = clean slate. If violations still exist in
-files, the first PostToolUse after editing them will recreate the
-locks. This prevents indefinite blocking from crashed sessions without
-any TTL complexity.
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ## Constraints for Solution Design
 
@@ -1158,9 +934,9 @@ earlier ones but are not blocked by them.
 **Effort**: 30 minutes | **Value**: High | **Risk**: None
 **Status**: **COMPLETE** (2026-02-21) — see `make-plankton-work.md`
 
-The `remaining` variable on line 1280 can capture multi-line output
-(e.g., `56\n0`), causing a bash syntax error on line 1282 and a garbled
-error message on line 1285. This breaks the hook even when the upstream
+The `remaining` variable on line 1307 can capture multi-line output
+(e.g., `56\n0`), causing a bash syntax error on line 1309 and a garbled
+error message on line 1312. This breaks the hook even when the upstream
 bug is fixed.
 
 **Root cause (C1 investigation, 2026-02-21)**: The `|| echo "[]"`
@@ -1202,7 +978,7 @@ file type handlers in `rerun_phase2()`:
    input and an empty array is the correct fallback.
 
 2. **Defensive fix** (guards against other leaks): Add `| tail -1` to
-   line 1280:
+   line 1307:
 
 ```bash
 remaining=$(rerun_phase2 "${file_path}" "${file_type}" | tail -1)
@@ -1229,102 +1005,18 @@ system-reminder channel is sufficient before implementing workarounds.
 
 ### Step 3: Implement Strategy 4 Workaround (PreToolUse Gate)
 
-**Effort**: 2 hours | **Value**: Highest | **Risk**: Low
-**Status**: Ready to implement (unblocked by Step 2 results)
-
-> **SUPERSEDED**: This step is superseded by `make-plankton-work.md`
-> which takes a verification-first approach: confirm whether the
-> existing stderr+exit2→system-reminder channel provides sufficient
-> agent feedback BEFORE implementing workarounds. If the system-reminder
-> channel proves sufficient, the PreToolUse gate is unnecessary.
-> Only proceed with this step if `make-plankton-work.md` Step 3
-> determines the system-reminder channel is insufficient.
-
-Step 2 investigations confirmed no simpler fix exists. Implement
-Strategy 4 (PreToolUse gate with enriched lock files) — see the
-Recommended Approach section for full design, failure mode analysis,
-and stale lock cleanup mechanism.
-
-**Implementation checklist**:
-
-1. In `multi_linter.sh` PostToolUse, on exit 2: Write enriched lock
-   file to `.claude/violation-locks/<hash>` containing file path,
-   violation count, and timestamp as JSON
-2. In `multi_linter.sh` PostToolUse, on exit 0: Remove lock file
-3. Create/update PreToolUse hook to check for lock files and block
-   edits via `{"decision":"block","reason":"..."}` with violation
-   details from the lock file
-4. Add SessionStart hook: `rm -rf .claude/violation-locks/`
-5. In `.gitignore`: Add `.claude/violation-locks/`
-
-**Acceptance criteria**:
-
-- [ ] `HOOK_SKIP_SUBPROCESS=1` + file with violations →
-  `.claude/violation-locks/<hash>` exists with valid JSON
-- [ ] Lock file contains file path, count, and timestamp
-- [ ] Clean file (exit 0) → lock file for that path does not exist
-- [ ] PreToolUse gate blocks edit to file with existing lock
-- [ ] PreToolUse block message includes file path and violation count
-- [ ] PreToolUse block message says violations are in the file, not
-  the hook (Layer 3 prevention)
-- [ ] PreToolUse gate allows edit after lock removed (violations fixed)
-- [ ] SessionStart hook clears `.claude/violation-locks/`
-- [ ] `.gitignore` contains `.claude/violation-locks/`
-- [ ] Manual test: in a live session, Write a file with ShellCheck
-  violations → agent is blocked on next edit with specific violation
-  info, fixes violations, lock removed, next edit proceeds
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Step 4: File Upstream Bug Report
 
-**Effort**: 30 minutes | **Value**: Medium | **Risk**: None
-**Status**: Ready (Step 2 complete, include investigation results)
-
-> **SUPERSEDED**: This step is superseded by `make-plankton-work.md`
-> Step 4 Option B. The framing below is based on the pre-mitmproxy
-> "unconditionally dropped" conclusion. The corrected framing
-> acknowledges stderr+exit2 IS delivered via system-reminder.
-
-File upstream only if Step 3 in `make-plankton-work.md` identifies a
-real CC behavior issue. Original (incorrect) framing preserved below
-for historical context:
-
-- Original title: `[Regression] PostToolUse command hook output
-  silently dropped since v2.1.31`
-- Original body: five-channel test matrix, regression timeline
-- Cross-reference: #11224, #18427, #23381, #27314, #19009, #19115,
-  #24788
-- Do NOT include workaround details — keep the report focused on the
-  defect
-- Tag: `bug`, `hooks`, `regression`
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ### Step 5: Transition Plan (When Upstream Fix Ships)
 
-**Fix completion criterion**: The upstream fix is considered complete
-when `stderr + exit 2` output appears in the `tool_result` content
-field. Partial fixes (e.g., JSON stdout only, or terminal-only
-rendering) do not warrant removing the workaround.
-
-**Fix detection**: Monitor GitHub issues #18427 (primary — directly
-confirms our bug) and #23381 (regression evidence). On each CC version
-upgrade, re-run the minimal reproduction test (Reproduction Steps
-above) and check whether hook stderr appears in the JSONL tool_result.
-
-When the fix is confirmed:
-
-1. Remove PreToolUse gate hook logic (lock file checking)
-2. Remove lock file write/delete logic from `multi_linter.sh`
-3. Remove SessionStart cleanup hook
-4. Remove `.claude/violation-locks/` directory
-5. Remove `.claude/violation-locks/` from `.gitignore`
-6. Verify: in a live session, hook stderr reaches the agent's
-   tool_result on exit 2
-7. Clean up any stale lock files
-
-**Note**: Until the upstream fix ships, if PostToolUse output starts
-appearing in tool_results after a CC upgrade (e.g., partial fix), the
-agent may receive duplicate violation info (from both hook stderr and
-PreToolUse gate). This is harmless but signals it's time to execute
-this transition plan.
+> **Superseded** — see `make-plankton-work.md` for the
+> verification-first approach that replaced this section.
 
 ---
 

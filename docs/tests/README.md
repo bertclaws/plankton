@@ -306,3 +306,44 @@ fires on the `Stop` lifecycle event, which occurs at session end. TeamCreate
 teammates trigger `TeammateIdle` when they finish, not `Stop`. Testing the
 stop hook requires a manual session
 (see [Test Stop hook](#test-stop-hook-stop_config_guardiansh)).
+
+## Regression Testing After Hook Changes
+
+After modifying `.claude/hooks/multi_linter.sh`, run these tests
+to verify no regressions:
+
+1. **Self-test suite** (structural + functional):
+
+   ```bash
+   bash .claude/hooks/test_hook.sh --self-test
+   ```
+
+   Expected: 110+ pass, 2 known failures (Python valid file
+   detection, TS disabled skip counting).
+
+2. **Feedback loop verification** (all file types):
+
+   ```bash
+   bash .claude/tests/hooks/verify_feedback_loop.sh
+   ```
+
+   Expected: 28+ pass, 0 fail. Skips are OK for linters not
+   installed locally.
+
+3. **Production path** (subprocess delegation with mock):
+
+   ```bash
+   bash .claude/tests/hooks/test_production_path.sh
+   ```
+
+   Tests the full subprocess delegation flow using a mock
+   `claude` binary. No API access required.
+
+4. **Five-channel output verification**:
+
+   ```bash
+   bash .claude/tests/hooks/test_five_channels.sh
+   ```
+
+   Automated channel output tests. Use `--runbook` flag for
+   mitmproxy-based system-reminder delivery verification.
