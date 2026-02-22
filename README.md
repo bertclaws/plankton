@@ -4,6 +4,50 @@
 
 Real-time code quality enforcement for AI coding agents, built on Claude Code hooks.
 
+> [!CAUTION]
+> Research project under active development. Hooks are tested against
+> Claude Code >= 2.1.50 (see badge). Newer CC versions usually work
+> but are not guaranteed. **Disable CC auto-updates** to prevent
+> silent breakage (see Quick Start). If you encounter issues, file a
+> report including the output of `claude --version`. To pin to a
+> specific Plankton version: `git checkout v0.1.0`.
+
+## quick start
+
+```bash
+git clone https://github.com/alexfazio/plankton.git
+cd plankton
+pip install uv && uv sync --all-extras
+claude                # hooks activate automatically
+```
+
+That's it. Plankton works by being the directory you run Claude Code from.
+The hooks in `.claude/hooks/` are picked up automatically — no install
+command, no plugin, no config. Clone, cd, claude.
+
+> [!TIP]
+> You can work on any codebase from inside plankton. Just tell Claude:
+> *"work on /path/to/my-project"* — it will apply the same quality
+> enforcement to that codebase while the hooks stay active.
+
+**Recommended: disable Claude Code auto-updates.** Plankton depends on
+undocumented CC internals — a silent auto-update can break hooks without
+warning.
+
+```bash
+# Option A: disable auto-updates entirely (most reliable)
+echo 'export DISABLE_AUTOUPDATER=1' >> ~/.zshrc && source ~/.zshrc
+
+# Option B: use the stable channel (~1 week behind latest, fewer regressions)
+curl -fsSL https://claude.ai/install.sh | bash -s stable
+```
+
+Only `jaq` and `ruff` are required. Everything else is optional and
+gracefully skipped if not installed. See [docs/SETUP.md](docs/SETUP.md)
+for per-language installation and configuration.
+
+## what is plankton
+
 AI coding agents write fast but they don't follow your rules. Formatting
 drifts, naming conventions get ignored, dead code piles up as agents iterate
 and refactor, and stylistic choices you actually care about (quote style,
@@ -32,51 +76,6 @@ MCP, permissions, tools. Everyone's still figuring out how to hold it.
 Plankton is the enforcement dimension of that layer.
 
 Like the organism: tiny, everywhere, filtering everything.
-
-> [!CAUTION]
-> Research project under active development. Hooks are tested against
-> Claude Code >= 2.1.50 (see badge). Newer CC versions usually work
-> but are not guaranteed. **Disable CC auto-updates** to prevent
-> silent breakage (see Quick Start). If you encounter issues, file a
-> report including the output of `claude --version`.
-
-## quick start
-
-1. **Disable Claude Code auto-updates** (recommended). Plankton depends on
-   undocumented CC internals — a silent auto-update can break hooks without
-   warning. Pick one:
-
-   ```bash
-   # Option A: disable auto-updates entirely (most reliable)
-   echo 'export DISABLE_AUTOUPDATER=1' >> ~/.zshrc && source ~/.zshrc
-
-   # Option B: use the stable channel (~1 week behind latest, fewer regressions)
-   curl -fsSL https://claude.ai/install.sh | bash -s stable
-   ```
-
-   Check your current version: `claude --version`
-
-   Tested with Claude Code >= 2.1.50.
-
-2. **Clone the repository**:
-
-   ```bash
-   git clone https://github.com/alexfazio/plankton.git
-   cd plankton
-   ```
-
-3. **Install dependencies**:
-
-   ```bash
-   pip install uv
-   uv sync --all-extras
-   ```
-
-4. **Start a Claude Code session**. Hooks activate automatically.
-
-Only `jaq` and `ruff` are required. Everything else is optional and
-gracefully skipped if not installed. See [docs/SETUP.md](docs/SETUP.md)
-for per-language installation and configuration.
 
 ## verify
 
