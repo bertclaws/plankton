@@ -40,7 +40,7 @@ RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @biomejs/biome markdownlint-cli2
+    && npm install -g @biomejs/biome@2.3.15 markdownlint-cli2
 
 # Python linting tools
 RUN pip install --no-cache-dir \
