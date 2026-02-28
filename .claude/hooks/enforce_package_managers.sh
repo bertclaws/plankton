@@ -10,7 +10,10 @@
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_source="${BASH_SOURCE[0]}"
+script_dir="${script_source%/*}"
+[[ "${script_dir}" == "${script_source}" ]] && script_dir="."
+script_dir="$(cd "${script_dir}" && pwd)"
 # shellcheck source=.claude/hooks/platform_shim.sh
 source "${script_dir}/platform_shim.sh"
 
@@ -29,6 +32,7 @@ if [[ "${tool_name}" != "Bash" ]]; then
 fi
 
 # Extract command string; fail-open if jaq missing or input malformed
+# shellcheck disable=SC2310  # get_command is an intentional predicate here
 cmd=$(get_command "${input}" "${platform}") || {
   emit_approve "${platform}"; exit 0
 }

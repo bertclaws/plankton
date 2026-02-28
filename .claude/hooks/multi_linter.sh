@@ -238,7 +238,8 @@ platform=$(detect_platform "${input}")
 tool_name=$(get_tool_name "${input}" "${platform}")
 
 # Copilot has no matcher support; filter non-edit tools here.
-if [[ "${tool_name}" != "Edit" ]] && [[ "${tool_name}" != "Write" ]]; then
+# Allow empty tool_name for direct/self-test invocations that only provide tool_input.
+if [[ -n "${tool_name}" ]] && [[ "${tool_name}" != "Edit" ]] && [[ "${tool_name}" != "Write" ]]; then
   exit 0
 fi
 
