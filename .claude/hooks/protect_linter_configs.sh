@@ -12,20 +12,27 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.claude/hooks/platform_shim.sh
+source "${script_dir}/platform_shim.sh"
+
 # Read JSON input from stdin
 input=$(cat)
+platform=$(detect_platform "${input}")
+tool_name=$(get_tool_name "${input}" "${platform}")
 
-# Extract file path from tool_input
-# If jaq fails (missing/crash), fail-open with valid JSON schema
-file_path=$(jaq -r '.tool_input?.file_path? // empty' \
-  <<<"${input}" 2>/dev/null) || {
-  echo '{"decision": "approve"}'
+# Copilot has no matcher support; filter non-edit tools here.
+if [[ "${tool_name}" != "Edit" ]] && [[ "${tool_name}" != "Write" ]]; then
+  emit_approve "${platform}"
   exit 0
-}
+fi
+
+# Extract file path from normalized tool input
+file_path=$(get_file_path "${input}" "${platform}")
 
 # Skip if no file path (approve with valid JSON)
 if [[ -z "${file_path}" ]]; then
-  echo '{"decision": "approve"}'
+  emit_approve "${platform}"
   exit 0
 fi
 
@@ -37,9 +44,7 @@ basename=$(basename "${file_path}")
 if [[ "${file_path}" == *"/.claude/hooks/"* ]] \
   || [[ "${file_path}" == *"/.claude/settings.json" ]] \
   || [[ "${file_path}" == *"/.claude/settings.local.json" ]]; then
-  cat <<EOF
-{"decision": "block", "reason": "Protected Claude Code config (${basename}). Hook scripts and settings are immutable."}
-EOF
+  emit_block "${platform}" "Protected Claude Code config (${basename}). Hook scripts and settings are immutable."
   exit 0
 fi
 
@@ -77,12 +82,10 @@ is_protected_config() {
 
 # Check if this is a protected linter config file
 if is_protected_config "${basename}"; then
-  cat <<EOF
-{"decision": "block", "reason": "Protected linter config file (${basename}). Fix the code, not the rules."}
-EOF
+  emit_block "${platform}" "Protected linter config file (${basename}). Fix the code, not the rules."
   exit 0
 fi
 
 # Not a protected file, allow operation
-echo '{"decision": "approve"}'
+emit_approve "${platform}"
 exit 0

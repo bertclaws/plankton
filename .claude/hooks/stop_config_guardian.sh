@@ -16,8 +16,13 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.claude/hooks/platform_shim.sh
+source "${script_dir}/platform_shim.sh"
+
 # Read JSON input from stdin
 input=$(cat)
+platform=$(detect_platform "${input}")
 
 # Extract stop_hook_active flag to prevent infinite loops
 # When true, Claude is already continuing due to a previous stop hook block
@@ -25,7 +30,7 @@ stop_hook_active=$(jaq -r '.stop_hook_active // false' <<<"${input}" 2>/dev/null
 
 # If stop hook is already active, approve to prevent infinite loops
 if [[ "${stop_hook_active}" == "true" ]]; then
-  echo '{"decision": "approve"}'
+  emit_approve "${platform}"
   exit 0
 fi
 
@@ -72,7 +77,7 @@ done
 
 # No modifications detected - approve session end
 if [[ ${#modified_files[@]} -eq 0 ]]; then
-  echo '{"decision": "approve"}'
+  emit_approve "${platform}"
   exit 0
 fi
 
@@ -95,7 +100,7 @@ if [[ -f "${GUARD_FILE}" ]]; then
   done
 
   if [[ "${all_approved}" == "true" ]]; then
-    echo '{"decision": "approve"}'
+    emit_approve "${platform}"
     exit 0
   else
     # Hash mismatch - new content after previous approval, need to re-prompt
@@ -103,6 +108,13 @@ if [[ -f "${GUARD_FILE}" ]]; then
   fi
 fi
 # === END HASH-BASED GUARD CHECK ===
+
+# Copilot currently ignores agentStop output; enforce warn-only behavior there.
+if [[ "${platform}" == "copilot" ]]; then
+  printf '[hook:warning] Protected config changes detected at stop: %s\n' "${modified_files[*]}" >&2
+  emit_approve "${platform}"
+  exit 0
+fi
 
 # Build display list
 files_display=$(printf '  - %s\n' "${modified_files[@]}")
@@ -146,13 +158,6 @@ After user responds:
 REASON
 
 # Return block decision to trigger AskUserQuestion workflow
-jaq -n \
-  --arg reason "${reason_msg}" \
-  --arg msg "${system_msg}" \
-  "{
-    \"decision\": \"block\",
-    \"reason\": \$reason,
-    \"systemMessage\": \$msg
-  }"
+emit_block "${platform}" "${reason_msg}" "${system_msg}"
 
 exit 0

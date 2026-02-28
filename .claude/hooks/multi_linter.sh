@@ -1,6 +1,6 @@
 #!/bin/bash
 # shellcheck disable=SC2310  # functions in if/|| is intentional throughout
-# multi_linter.sh - Claude Code PostToolUse hook for multi-language linting
+# multi_linter.sh - Claude/Copilot PostToolUse hook for multi-language linting
 # Supports: Python (ruff+ty+flake8-pydantic+flake8-async), Shell (shellcheck+shfmt),
 #           YAML (yamllint), JSON (jaq/biome), Dockerfile (hadolint),
 #           TOML (taplo), Markdown (markdownlint-cli2),
@@ -27,6 +27,10 @@
 
 set -euo pipefail
 trap 'kill 0' SIGTERM
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.claude/hooks/platform_shim.sh
+source "${script_dir}/platform_shim.sh"
 
 # Fail-open if jaq is not installed (required for JSON parsing)
 if ! command -v jaq >/dev/null 2>&1; then
@@ -230,6 +234,13 @@ load_model_patterns
 
 # Read JSON input from stdin
 input=$(cat)
+platform=$(detect_platform "${input}")
+tool_name=$(get_tool_name "${input}" "${platform}")
+
+# Copilot has no matcher support; filter non-edit tools here.
+if [[ "${tool_name}" != "Edit" ]] && [[ "${tool_name}" != "Write" ]]; then
+  exit 0
+fi
 
 # Track if any issues found
 has_issues=false
@@ -242,8 +253,8 @@ file_type=""
 
 # Note: HOOK_SUBPROCESS_TIMEOUT env var is handled inside load_model_patterns
 
-# Extract file path from tool_input
-file_path=$(jaq -r '.tool_input?.file_path? // empty' <<<"${input}" 2>/dev/null) || file_path=""
+# Extract file path from normalized tool input
+file_path=$(get_file_path "${input}" "${platform}") || file_path=""
 
 # Skip if no file path or file doesn't exist
 [[ -z "${file_path}" ]] && exit 0

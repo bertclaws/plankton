@@ -10,18 +10,29 @@
 
 set -euo pipefail
 
-# Session-level bypass (HOOK_SKIP_PM=1 claude ...)
-if [[ "${HOOK_SKIP_PM:-0}" == "1" ]]; then
-  echo '{"decision": "approve"}'; exit 0
-fi
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.claude/hooks/platform_shim.sh
+source "${script_dir}/platform_shim.sh"
 
 input=$(cat)
+platform=$(detect_platform "${input}")
+tool_name=$(get_tool_name "${input}" "${platform}")
+
+# Session-level bypass (HOOK_SKIP_PM=1 claude ...)
+if [[ "${HOOK_SKIP_PM:-0}" == "1" ]]; then
+  emit_approve "${platform}"; exit 0
+fi
+
+# Copilot has no matcher support; filter non-bash tools here.
+if [[ "${tool_name}" != "Bash" ]]; then
+  emit_approve "${platform}"; exit 0
+fi
 
 # Extract command string; fail-open if jaq missing or input malformed
-cmd=$(jaq -r '.tool_input?.command? // empty' <<<"${input}" 2>/dev/null) || {
-  echo '{"decision": "approve"}'; exit 0
+cmd=$(get_command "${input}" "${platform}") || {
+  emit_approve "${platform}"; exit 0
 }
-[[ -z "${cmd}" ]] && { echo '{"decision": "approve"}'; exit 0; }
+[[ -z "${cmd}" ]] && { emit_approve "${platform}"; exit 0; }
 
 config_file="${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/config.json"
 
@@ -283,7 +294,7 @@ approve() {
     local log_file="/tmp/.pm_enforcement_${HOOK_GUARD_PID:-${PPID}}.log"
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | approve | | | ${cmd:0:80}" >> "${log_file}" 2>/dev/null || true
   fi
-  echo '{"decision": "approve"}'
+  emit_approve "${platform}"
   exit 0
 }
 
@@ -300,7 +311,7 @@ block() {
     local log_file="/tmp/.pm_enforcement_${HOOK_GUARD_PID:-${PPID}}.log"
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | block | ${tool} | ${subcmd} | ${cmd:0:80}" >> "${log_file}" 2>/dev/null || true
   fi
-  echo "{\"decision\": \"block\", \"reason\": \"[hook:block] ${tool} is not allowed. Use: ${replacement}\"}"
+  emit_block "${platform}" "[hook:block] ${tool} is not allowed. Use: ${replacement}"
   exit 0
 }
 
@@ -317,7 +328,7 @@ warn() {
     local log_file="/tmp/.pm_enforcement_${HOOK_GUARD_PID:-${PPID}}.log"
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | warn | ${tool} | ${subcmd} | ${cmd:0:80}" >> "${log_file}" 2>/dev/null || true
   fi
-  echo '{"decision": "approve"}'
+  emit_approve "${platform}"
   echo "[hook:advisory] ${tool} detected. Prefer: ${replacement}" >&2
   exit 0
 }
@@ -481,5 +492,5 @@ if [[ "${js_mode}" != "off" ]]; then
 
 fi
 
-echo '{"decision": "approve"}'
+emit_approve "${platform}"
 exit 0

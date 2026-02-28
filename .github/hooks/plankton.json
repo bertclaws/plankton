@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": ".claude/hooks/protect_linter_configs.sh",
+        "timeoutSec": 5
+      },
+      {
+        "type": "command",
+        "bash": ".claude/hooks/enforce_package_managers.sh",
+        "timeoutSec": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": ".claude/hooks/multi_linter.sh",
+        "timeoutSec": 600
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": ".claude/hooks/stop_config_guardian.sh",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}
